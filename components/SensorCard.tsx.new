@@ -1,0 +1,258 @@
+import { View, Text, StyleSheet, ActivityIndicator, TouchableOpacity } from 'react-native';
+import { LinearGradient } from 'expo-linear-gradient';
+import { MaterialIcons } from '@expo/vector-icons';
+import { useRouter } from 'expo-router';
+import { useSensorData } from '../hooks/useSensorData-production';
+import { auth } from '../firebase/firebaseConfig';
+
+interface Props {
+  sensorId: number | string;
+  sensorName: string;
+  sensorType: string;
+  unit: string;
+  deviceName?: string;
+  deviceId?: string;
+}
+
+export default function SensorCard({
+  sensorId,
+  sensorName,
+  sensorType,
+  unit,
+  deviceName,
+  deviceId,
+}: Props) {
+  const router = useRouter();
+  const userId = auth.currentUser?.uid || '';
+  const { readings, stats, loading, error } = useSensorData(sensorId as number, 24, undefined, userId);
+
+  const handlePress = () => {
+    router.push({
+      pathname: '/sensor-detail',
+      params: {
+        sensorId: String(sensorId),
+        sensorName,
+        sensorType,
+        unit,
+        deviceId: deviceId || deviceName,
+      },
+    });
+  };
+
+  const getDisplayName = (name: string) => {
+    const nameMap: { [key: string]: string } = {
+      'Battery Level': 'Humidity',
+      'GPU Temperature': 'Ambient Temperature',
+      'Disk Usage': 'PM 2.5',
+      'Memory Usage': 'PM10',
+      'CPU Temperature': 'Device CPU Temperature',
+    };
+    return nameMap[name] || name;
+  };
+
+  const displayName = getDisplayName(sensorName);
+
+  const currentValue = readings?.[0]?.value?.toFixed(2);
+  const avgValue = stats?.avg_value ? stats.avg_value.toFixed(2) : '--';
+  const minValue = stats?.min_value ? stats.min_value.toFixed(2) : '--';
+  const maxValue = stats?.max_value ? stats.max_value.toFixed(2) : '--';
+  const readingCount = stats?.reading_count || 0;
+
+  const getGradientColors = () => {
+    switch (sensorType) {
+      case 'temperature':
+        return ['#FF6B6B', '#FFA500'];
+      case 'humidity':
+        return ['#4ECDC4', '#45B7D1'];
+      case 'pressure':
+        return ['#95E1D3', '#38ADA9'];
+      case 'memory':
+        return ['#FFD93D', '#FFA500'];
+      case 'wind_speed':
+        return ['#A8E6CF', '#56CCF2'];
+      case 'rainfall':
+        return ['#4FA3FF', '#1B6CA8'];
+      default:
+        return ['#667EEA', '#764BA2'];
+    }
+  };
+
+  const getSensorIcon = () => {
+    switch (sensorType) {
+      case 'temperature':
+        return 'thermostat';
+      case 'humidity':
+        return 'water-drop';
+      case 'pressure':
+        return 'compress';
+      case 'memory':
+        return 'storage';
+      case 'wind_speed':
+        return 'air';
+      case 'rainfall':
+        return 'cloud-queue';
+      default:
+        return 'sensors';
+    }
+  };
+
+  if (error) {
+    return (
+      <View style={styles.errorCard}>
+        <Text style={styles.errorText}>Error: {error}</Text>
+      </View>
+    );
+  }
+
+  return (
+    <TouchableOpacity onPress={handlePress} activeOpacity={0.8}>
+      <LinearGradient
+        colors={getGradientColors()}
+        start={{ x: 0, y: 0 }}
+        end={{ x: 1, y: 1 }}
+        style={styles.card}
+      >
+        <View style={styles.header}>
+          <View style={styles.titleContainer}>
+            <MaterialIcons
+              name={getSensorIcon()}
+              size={18}
+              color="#fff"
+              style={styles.icon}
+            />
+            <View>
+              <Text style={styles.title}>{displayName}</Text>
+              {deviceName && (
+                <Text style={styles.device}>{deviceName}</Text>
+              )}
+            </View>
+          </View>
+          {loading && <ActivityIndicator size="small" color="#fff" />}
+        </View>
+
+        <View style={styles.mainValue}>
+          {loading && !currentValue ? (
+            <ActivityIndicator size="large" color="#fff" />
+          ) : (
+            <>
+              <Text style={styles.currentValue}>{currentValue || '--'}</Text>
+              <Text style={styles.unit}>{unit}</Text>
+            </>
+          )}
+        </View>
+
+        {stats && (
+          <View style={styles.statsContainer}>
+            <View style={styles.stat}>
+              <Text style={styles.statLabel}>Avg</Text>
+              <Text style={styles.statValue}>{avgValue}</Text>
+            </View>
+            <View style={styles.statDivider} />
+            <View style={styles.stat}>
+              <Text style={styles.statLabel}>Min</Text>
+              <Text style={styles.statValue}>{minValue}</Text>
+            </View>
+            <View style={styles.statDivider} />
+            <View style={styles.stat}>
+              <Text style={styles.statLabel}>Max</Text>
+              <Text style={styles.statValue}>{maxValue}</Text>
+            </View>
+            <View style={styles.statDivider} />
+            <View style={styles.stat}>
+              <Text style={styles.statLabel}>Readings</Text>
+              <Text style={styles.statValue}>{readingCount}</Text>
+            </View>
+          </View>
+        )}
+      </LinearGradient>
+    </TouchableOpacity>
+  );
+}
+
+const styles = StyleSheet.create({
+  card: {
+    borderRadius: 12,
+    padding: 10,
+    marginBottom: 8,
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowRadius: 3,
+    elevation: 3,
+  },
+  header: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: 6,
+  },
+  titleContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+  },
+  icon: {
+    marginRight: 6,
+  },
+  title: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#fff',
+  },
+  device: {
+    fontSize: 10,
+    color: 'rgba(255,255,255,0.8)',
+    marginTop: 1,
+  },
+  mainValue: {
+    alignItems: 'center',
+    marginVertical: 8,
+  },
+  currentValue: {
+    fontSize: 28,
+    fontWeight: '800',
+    color: '#fff',
+  },
+  unit: {
+    fontSize: 12,
+    color: 'rgba(255,255,255,0.9)',
+    marginTop: 2,
+  },
+  statsContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    borderRadius: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 6,
+  },
+  stat: {
+    alignItems: 'center',
+    flex: 1,
+  },
+  statDivider: {
+    width: 1,
+    backgroundColor: 'rgba(255,255,255,0.3)',
+    marginHorizontal: 4,
+  },
+  statLabel: {
+    fontSize: 9,
+    color: 'rgba(255,255,255,0.8)',
+    fontWeight: '600',
+  },
+  statValue: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#fff',
+    marginTop: 1,
+  },
+  errorCard: {
+    backgroundColor: '#FF6B6B',
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 12,
+  },
+  errorText: {
+    color: '#fff',
+    fontSize: 12,
+  },
+});

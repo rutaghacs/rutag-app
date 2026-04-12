@@ -1,0 +1,71 @@
+{
+  "project_info": {
+    "project_number": "411882758714",
+    "firebase_url": "https://rutag-app-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "project_id": "rutag-app",
+    "storage_bucket": "rutag-app.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:411882758714:android:9e1b987c2e60ea3332cb03",
+        "android_client_info": {
+          "package_name": "com.gmail.rutaghacs.rutagapp"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "411882758714-ktgcafkhiu5ncor744eoftqlq95k2dba.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.gmail.rutaghacs.rutagapp",
+            "certificate_hash": "f2ae052b340c79d28546aaef1b7b1f1304c6d224"
+          }
+        },
+        {
+          "client_id": "411882758714-lse79pi6tq9h6lk0b93uj0nh4k150ath.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.gmail.rutaghacs.rutagapp",
+            "certificate_hash": "5e8f16062ea3cd2c4a0d547876baa6f38cabf625"
+          }
+        },
+        {
+          "client_id": "411882758714-ue6altcbarmqm0d0ho569q1utd0m99m6.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.gmail.rutaghacs.rutagapp",
+            "certificate_hash": "2f468f1b9845134f9dd948104d9f975e04e0755f"
+          }
+        },
+        {
+          "client_id": "411882758714-bptcdm2rf4c4goeitv2rifbn1u73o4dn.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDuUc-WDM9RSWhdpaXAAFH9R3U28P9jqr8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "411882758714-bptcdm2rf4c4goeitv2rifbn1u73o4dn.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "411882758714-mbvkfespmlmvc16rjpbt11u8bp5agjjk.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.gmail.rutaghacs.rutagapp"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
