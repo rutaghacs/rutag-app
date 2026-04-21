@@ -128,19 +128,19 @@ export default function SensorCard({
       case 'temperature':
       case 'temperature_humidity':
       case 'dht11':
-        return ['#E53E3E', '#C53030']; // Clean red gradient
+        return ['#E53E3E', '#C53030'] as const; // Clean red gradient
       case 'humidity':
-        return ['#3182CE', '#2B77CB']; // Professional blue
+        return ['#3182CE', '#2B77CB'] as const; // Professional blue
       case 'pressure':
-        return ['#38A169', '#2F855A']; // Clinical green
+        return ['#38A169', '#2F855A'] as const; // Clinical green
       case 'memory':
-        return ['#D69E2E', '#B7791F']; // Subtle amber
+        return ['#D69E2E', '#B7791F'] as const; // Subtle amber
       case 'wind_speed':
-        return ['#4A5568', '#2D3748']; // Professional gray
+        return ['#4A5568', '#2D3748'] as const; // Professional gray
       case 'rainfall':
-        return ['#3182CE', '#2C5F7C']; // Deep blue
+        return ['#3182CE', '#2C5F7C'] as const; // Deep blue
       default:
-        return ['#553C9A', '#44337A']; // Laboratory purple
+        return ['#553C9A', '#44337A'] as const; // Laboratory purple
     }
   };
 

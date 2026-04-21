@@ -1,7 +1,10 @@
 import * as Notifications from "expo-notifications";
-import { doc, updateDoc, serverTimestamp, setDoc } from "firebase/firestore";
+import { Platform } from "react-native";
 import { auth } from "./firebaseConfig";
-import { db } from "./firebaseConfig";
+
+const BASE_API_URL = process.env.EXPO_PUBLIC_API_URL || "http://13.205.201.82";
+const ALERT_API_ROOT = (process.env.EXPO_PUBLIC_ALERT_API_URL || `${BASE_API_URL}/alert-api`).replace(/\/$/, "");
+const ALERT_API_BASE = `${ALERT_API_ROOT}/api`;
 
 /**
  * 🔕 Clear the stored Expo push token for the current user before sign-out.
@@ -12,8 +15,19 @@ export const clearFCMToken = async () => {
   try {
     const user = auth.currentUser;
     if (!user) return;
-    const userRef = doc(db, "users", user.uid);
-    await updateDoc(userRef, { expoPushToken: null });
+    const tokenObj = await Notifications.getDevicePushTokenAsync();
+    const fcmToken = tokenObj.data as string;
+    const idToken = await user.getIdToken();
+
+    await fetch(`${ALERT_API_BASE}/push-tokens/deactivate`, {
+      method: "DELETE",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${idToken}`,
+      },
+      body: JSON.stringify({ token: fcmToken }),
+    });
+
     console.log("[FCM] ✅ Push token cleared for user:", user.uid);
   } catch (error) {
     // Non-fatal - best-effort cleanup
@@ -50,17 +64,31 @@ export const registerFCMToken = async () => {
 
     const user = auth.currentUser;
     if (user) {
-      console.log("[FCM] Storing FCM token for user:", user.uid);
-      const userRef = doc(db, "users", user.uid);
-      await setDoc(
-        userRef,
-        {
-          expoPushToken: fcmToken,
-          tokenUpdatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
-      console.log("[FCM] Token stored in Firestore successfully");
+      console.log("[FCM] Registering push token in EC2 alert API for user:", user.uid);
+
+      try {
+        let pushAuthHeader: Record<string, string> = {};
+        try {
+          const idToken = await user.getIdToken();
+          pushAuthHeader = { Authorization: `Bearer ${idToken}` };
+        } catch { /* best-effort */ }
+        await fetch(`${ALERT_API_BASE}/push-tokens/register`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...pushAuthHeader,
+          },
+          body: JSON.stringify({
+            token: fcmToken,
+            provider: "fcm",
+            platform: Platform.OS,
+          }),
+        });
+      } catch (apiError) {
+        console.warn("[FCM] EC2 push token registration failed:", apiError);
+      }
+
+      console.log("[FCM] Token registration complete (EC2)");
     } else {
       console.warn("[FCM] No user logged in, cannot store token");
     }

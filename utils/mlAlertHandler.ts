@@ -128,8 +128,8 @@ export function formatMLAlertForDisplay(alert: MLAlert): string {
     formatted += `✅ Acknowledged\n`;
   }
 
-  if (alert.rating) {
-    formatted += `⭐ Rating: ${alert.rating}/10 (${alert.ratingAccuracy ? "Accurate" : "Inaccurate"})\n`;
+  if (alert.userRating) {
+    formatted += `⭐ Rating: ${alert.userRating}/10 (${alert.ratingAccuracy ? "Accurate" : "Inaccurate"})\n`;
   }
 
   return formatted;
@@ -139,7 +139,7 @@ export function formatMLAlertForDisplay(alert: MLAlert): string {
  * Rate/feedback on ML alert
  */
 export async function rateMLAlert(
-  deviceId: string,
+  _deviceId: string,
   alertId: string,
   rating: number,
   isAccurate: boolean,
@@ -150,7 +150,7 @@ export async function rateMLAlert(
       throw new Error("Rating must be between 1 and 10");
     }
 
-    await updateMLAlertRating(deviceId, alertId, rating, isAccurate, notes);
+    await updateMLAlertRating(alertId, rating, isAccurate, notes);
     console.log("[MLAlertHandler] ✅ ML alert rated:", alertId);
   } catch (error) {
     console.error("[MLAlertHandler] Error rating ML alert:", error);

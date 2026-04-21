@@ -83,10 +83,7 @@ export const sendTestNotification = async (
           testData: true,
         },
       },
-      trigger: {
-        type: "time",
-        seconds: 2,
-      },
+      trigger: null,
     });
     console.log("[Notifications] Test notification scheduled");
   } catch (error) {
@@ -123,10 +120,7 @@ export const sendSensorAlert = async (
           threshold: threshold?.toString() || "",
         },
       },
-      trigger: {
-        type: "time",
-        seconds: 1,
-      },
+      trigger: null,
     });
     
     console.log("[Notifications] Sensor alert sent:", sensorName);
@@ -161,10 +155,7 @@ export const sendMLAlertNotification = async (alert: MLAlert) => {
           timestamp: alert.timestamp?.toISOString?.() || new Date().toISOString(),
         },
       },
-      trigger: {
-        type: "time",
-        seconds: 1,
-      },
+      trigger: null,
     });
 
     console.log("[Notifications] ✅ ML alert notification sent");

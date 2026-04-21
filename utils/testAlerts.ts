@@ -41,10 +41,7 @@ export const triggerTestAlert = async (deviceId: string, deviceLabel: string = "
           deviceLabel,
         },
       },
-      trigger: {
-        type: "timeInterval",
-        seconds: 1, // Show immediately
-      },
+      trigger: null,
     });
 
     console.log("[TestAlert] ✅ Local notification sent");

@@ -5,7 +5,6 @@ import { auth } from "../firebase/firebaseConfig";
 import { useState, useEffect, useRef } from "react";
 import { listenToUserDevices, updateDeviceLabel, getAvailableDevicesForUser, claimDevice, unclaimDevice, listenToUserMLAlerts, updateMLAlertRating, getUserDevices, getUserAlertRetentionDays, saveUserAlertRetentionDays, type AlertRetentionDays } from "../db/firestore";
 import { useRouter } from "expo-router";
-import { initPushNotifications, setupNotificationListeners } from "../utils/notifications";
 import { clearFCMToken } from "../firebase/fcmService";
 import { LinearGradient } from "expo-linear-gradient";
 import { MaterialIcons } from "@expo/vector-icons";
@@ -13,6 +12,8 @@ import * as Notifications from "expo-notifications";
 import type { MLAlert } from "../types/mlAlertTypes";
 import StyledAlert, { StyledAlertProps } from "../components/StyledAlert";
 import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const ALERT_RETENTION_STORAGE_KEY_PREFIX = 'alertRetentionDays:';
 
 export default function Dashboard() {
   const router = useRouter();
@@ -29,6 +30,7 @@ export default function Dashboard() {
   // Core State
   const [loggingOut, setLoggingOut] = useState(false);
   const [isUserLoggedIn, setIsUserLoggedIn] = useState(!!auth.currentUser);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(auth.currentUser?.uid ?? null);
   const [mlAlerts, setMLAlerts] = useState<MLAlert[]>([]);
   const [visibleAlertCount, setVisibleAlertCount] = useState(50);
   // Bumped once a day to trigger re-evaluation of the local retention filter
@@ -95,6 +97,17 @@ export default function Dashboard() {
   const sensorControlApiUrl = sensorControlHost.endsWith('/sensor-api')
     ? sensorControlHost
     : `${sensorControlHost}/sensor-api`;
+  const retentionStorageKey = `${ALERT_RETENTION_STORAGE_KEY_PREFIX}${currentUserId || 'anonymous'}`;
+  const legacyRetentionStorageKey = 'alertRetentionDays';
+
+  const parseRetentionDays = (value: string | null): AlertRetentionDays | null => {
+    if (value === null) return null;
+    const parsed = parseInt(value, 10);
+    if (parsed === 0 || parsed === 7 || parsed === 15 || parsed === 30) {
+      return parsed;
+    }
+    return null;
+  };
 
   // Cleanup function
   const cleanupDeviceReadingListeners = () => {
@@ -121,6 +134,7 @@ export default function Dashboard() {
     const unsubscribeAuth = onAuthStateChanged(auth, (currentUser) => {
       if (currentUser) {
         setIsUserLoggedIn(true);
+        setCurrentUserId(currentUser.uid);
         sessionSignInAtRef.current = Date.now();
         shownNotificationsRef.current = new Set();
         setVisibleAlertCount(50);
@@ -128,6 +142,7 @@ export default function Dashboard() {
         latestNotifiedAlertAtRef.current = 0;
       } else {
         setIsUserLoggedIn(false);
+        setCurrentUserId(null);
         setDevices([]);
         setMLAlerts([]);
         setVisibleAlertCount(50);
@@ -198,7 +213,7 @@ export default function Dashboard() {
               sound: true,
               data: { alertId: alert.id },
             },
-            trigger: { type: "time" as const, seconds: 1 },
+            trigger: null,
           }).catch(console.error);
         } catch (error) {
           console.error("[Dashboard] Exception scheduling notification:", error);
@@ -253,26 +268,6 @@ export default function Dashboard() {
     };
   }, [isUserLoggedIn]);
 
-  // Initialize notifications
-  useEffect(() => {
-    if (isUserLoggedIn) {
-      let cleanup: (() => void) | undefined;
-      const setupNotifications = async () => {
-        try {
-          await initPushNotifications();
-          cleanup = setupNotificationListeners();
-        } catch (error) {
-          console.error("[Dashboard] Failed to setup notifications:", error);
-        }
-      };
-      setupNotifications();
-
-      return () => {
-        if (cleanup) cleanup();
-      };
-    }
-  }, [isUserLoggedIn]);
-
   // Daily local retention filter pulse – forces re-render so old alerts are
   // hidden from the list without touching Firestore.
   useEffect(() => {
@@ -287,27 +282,33 @@ export default function Dashboard() {
   useEffect(() => {
     const loadAlertRetentionSetting = async () => {
       try {
-        const savedRemote = await getUserAlertRetentionDays();
-        setAlertRetentionDays(savedRemote);
-        await AsyncStorage.setItem('alertRetentionDays', savedRemote.toString());
-      } catch (remoteError) {
-        try {
-          const saved = await AsyncStorage.getItem('alertRetentionDays');
-          if (saved !== null) {
-            setAlertRetentionDays(parseInt(saved, 10) as AlertRetentionDays);
-          }
-        } catch (localError) {
-          console.error('Failed to load local alert retention setting:', localError);
+        const savedLocal = await AsyncStorage.getItem(retentionStorageKey);
+        const parsedLocal = parseRetentionDays(savedLocal);
+        if (parsedLocal !== null) {
+          setAlertRetentionDays(parsedLocal);
+          return;
         }
 
-        console.error('Failed to load remote alert retention setting:', remoteError);
+        const savedLegacy = await AsyncStorage.getItem(legacyRetentionStorageKey);
+        const parsedLegacy = parseRetentionDays(savedLegacy);
+        if (parsedLegacy !== null) {
+          setAlertRetentionDays(parsedLegacy);
+          await AsyncStorage.setItem(retentionStorageKey, parsedLegacy.toString());
+          return;
+        }
+
+        const savedDefault = await getUserAlertRetentionDays();
+        setAlertRetentionDays(savedDefault);
+        await AsyncStorage.setItem(retentionStorageKey, savedDefault.toString());
+      } catch (error) {
+        console.error('Failed to load local alert retention setting:', error);
       }
     };
 
-    if (isUserLoggedIn) {
+    if (isUserLoggedIn && currentUserId) {
       loadAlertRetentionSetting();
     }
-  }, [isUserLoggedIn]);
+  }, [isUserLoggedIn, currentUserId, retentionStorageKey]);
 
   // Handle logout
   const handleLogout = () => {
@@ -350,11 +351,21 @@ export default function Dashboard() {
     }
   };
 
+  const refreshDevicesNow = async () => {
+    try {
+      const latestDevices = await getUserDevices();
+      setDevices(latestDevices);
+    } catch (error) {
+      console.error("[Dashboard] Failed to refresh devices immediately:", error);
+    }
+  };
+
   // Handle claim device
   const handleClaimDevice = async (deviceId: string, label: string) => {
     setClaimingDeviceId(deviceId);
     try {
-      await claimDevice(deviceId, label);
+      await claimDevice(deviceId);
+      await refreshDevicesNow();
       showStyledAlert("Success", `Device "${label}" added to your account!`, "success");
       setShowAddModal(false);
       setAvailableDevices([]);
@@ -376,6 +387,7 @@ export default function Dashboard() {
       onConfirm: async () => {
         try {
           await unclaimDevice(deviceId);
+          await refreshDevicesNow();
           showStyledAlert("Success", "Device removed successfully", "success");
         } catch (error) {
           showStyledAlert("Error", "Failed to remove device", "error");
@@ -396,7 +408,23 @@ export default function Dashboard() {
       onConfirm: async (newName: string) => {
         if (newName.trim() && newName.trim() !== currentLabel) {
           try {
-            await updateDeviceLabel(deviceId, newName.trim());
+            const trimmedName = newName.trim();
+            await updateDeviceLabel(deviceId, trimmedName);
+
+            // Apply rename instantly in UI; backend polling will reconcile.
+            setDevices((previous) =>
+              previous.map((device) =>
+                String(device?.id || "") === String(deviceId)
+                  ? { ...device, label: trimmedName, userLabel: trimmedName }
+                  : device
+              )
+            );
+
+            if (selectedDevice && String(selectedDevice?.id || "") === String(deviceId)) {
+              setSelectedDevice({ ...selectedDevice, label: trimmedName, userLabel: trimmedName });
+            }
+
+            await refreshDevicesNow();
             showStyledAlert("Success", "Device renamed successfully", "success");
           } catch (error) {
             showStyledAlert("Error", "Failed to rename device", "error");
@@ -556,18 +584,58 @@ export default function Dashboard() {
 
   // Handle alert rating
   const handleRateAlert = (alert: MLAlert) => {
+    const rawRating = (alert as any).userRating;
+    const parsedRating =
+      rawRating === null || rawRating === undefined || rawRating === ""
+        ? null
+        : (typeof rawRating === "number" ? rawRating : Number(rawRating));
+    const accuracyRaw = (alert as any).ratingAccuracy;
+    const normalizedAccuracy =
+      accuracyRaw === true || accuracyRaw === 1 || accuracyRaw === "true" || accuracyRaw === "1" || accuracyRaw === "yes"
+        ? true
+        : accuracyRaw === false || accuracyRaw === 0 || accuracyRaw === "false" || accuracyRaw === "0" || accuracyRaw === "no"
+          ? false
+          : null;
+
     setSelectedAlert(alert);
-    setSelectedRating(alert.rating || null);
-    setSelectedAccuracy(alert.ratingAccuracy ?? null);
+    setSelectedRating(
+      typeof parsedRating === "number" && Number.isFinite(parsedRating)
+        ? Math.min(10, Math.max(1, parsedRating))
+        : null
+    );
+    setSelectedAccuracy(normalizedAccuracy);
     setShowRatingModal(true);
   };
 
   // Submit rating
   const submitRating = async () => {
-    if (!selectedAlert || selectedRating === null || selectedAccuracy === null) return;
+    if (!selectedAlert?.id) return;
+
+    if (selectedRating === null || selectedAccuracy === null) {
+      showStyledAlert("Missing rating", "Please select accuracy and a score before submitting.", "info");
+      return;
+    }
 
     try {
       await updateMLAlertRating(selectedAlert.id, selectedRating, selectedAccuracy);
+
+      // Apply an optimistic local update so badge/score change immediately,
+      // without waiting for the next alerts polling cycle.
+      const normalizedRating = Math.min(10, Math.max(1, Number(selectedRating)));
+      setMLAlerts((prev) => {
+        const next = prev.map((alert) => {
+          if (alert.id !== selectedAlert.id) return alert;
+          return {
+            ...alert,
+            userRating: normalizedRating,
+            ratingAccuracy: selectedAccuracy,
+            acknowledged: true,
+          };
+        });
+        mlAlertsRef.current = next;
+        return next;
+      });
+
       showStyledAlert("Success", `Alert rated ${selectedRating}/10 and marked as ${selectedAccuracy ? 'accurate' : 'inaccurate'}`, "success");
       setShowRatingModal(false);
       setSelectedAlert(null);
@@ -580,15 +648,22 @@ export default function Dashboard() {
 
   // Save alert retention setting
   const saveAlertRetentionSetting = async (days: AlertRetentionDays) => {
+    setAlertRetentionDays(days);
+
     try {
-      await Promise.all([
-        AsyncStorage.setItem('alertRetentionDays', days.toString()),
-        saveUserAlertRetentionDays(days),
+      await AsyncStorage.multiSet([
+        [retentionStorageKey, days.toString()],
+        [legacyRetentionStorageKey, days.toString()],
       ]);
-      setAlertRetentionDays(days);
+    } catch (error) {
+      console.error('Failed to persist local alert retention setting:', error);
+    }
+
+    try {
+      await saveUserAlertRetentionDays(days);
       showStyledAlert("Success", `Alerts will be retained for ${days === 0 ? 'forever' : days + ' days'}`, "success");
     } catch (error) {
-      showStyledAlert("Error", "Failed to save setting", "error");
+      showStyledAlert("Error", "Failed to save alert retention setting locally", "error");
     }
   };
 
@@ -617,13 +692,6 @@ export default function Dashboard() {
     }
   };
 
-  const getRiskStyle = (risk?: string) => {
-    const normalized = (risk || "").toLowerCase();
-    if (normalized.includes("critical")) return styles.riskCritical;
-    if (normalized.includes("high") || normalized.includes("medium")) return styles.riskMedium;
-    return styles.riskLow;
-  };
-
   const getDeviceOnline = (device: any) => {
     if (typeof device.active === "boolean") return device.active;
     if (typeof device.online === "boolean") return device.online;
@@ -638,11 +706,23 @@ export default function Dashboard() {
     return "";
   };
 
-  const getRiskBadgeLabel = (risk?: string) => {
-    const normalized = (risk || "").toLowerCase();
-    if (normalized.includes("critical")) return "CRITICAL";
-    if (normalized.includes("high") || normalized.includes("medium")) return "MEDIUM SEVERITY";
-    return "LOW";
+  const getNotificationTypeLabel = (value?: string) => {
+    const normalized = String(value || "Alert").trim();
+    if (!normalized) return "Alert";
+    return normalized.charAt(0).toUpperCase() + normalized.slice(1).toLowerCase();
+  };
+
+  const getAlertDeviceDisplayName = (alert: MLAlert) => {
+    const matchedDevice = devices.find((device) => String(device?.id || "") === String(alert.deviceId || ""));
+    if (matchedDevice?.label) return String(matchedDevice.label);
+    if (matchedDevice?.name) return String(matchedDevice.name);
+
+    const rawIdentifier = String(alert.deviceIdentifier || "").trim();
+    const rawDeviceId = String(alert.deviceId || "").trim();
+
+    if (rawIdentifier && rawIdentifier !== rawDeviceId) return rawIdentifier;
+    if (rawDeviceId) return rawDeviceId;
+    return "raspberrypi";
   };
 
   const getTemperaturePreview = (alert: MLAlert) => {
@@ -678,6 +758,24 @@ export default function Dashboard() {
       reading,
       limit,
     };
+  };
+
+  const getAlertAccuracyState = (value: unknown): "accurate" | "inaccurate" | "unrated" => {
+    if (value === true || value === 1) return "accurate";
+    if (value === false || value === 0) return "inaccurate";
+
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      if (normalized === "true" || normalized === "1" || normalized === "yes") return "accurate";
+      if (normalized === "false" || normalized === "0" || normalized === "no") return "inaccurate";
+      if (normalized === "" || normalized === "null" || normalized === "undefined" || normalized === "unrated") {
+        return "unrated";
+      }
+      return "unrated";
+    }
+
+    if (value === null || value === undefined) return "unrated";
+    return "unrated";
   };
 
   const getDeviceLastPulse = (device: any) => {
@@ -768,10 +866,29 @@ export default function Dashboard() {
                 <FlatList
                   data={visibleAlerts}
                   scrollEnabled={false}
-                  keyExtractor={(item) => item.id}
+                  keyExtractor={(item) => item.id ?? `${item.deviceId}-${item.timestamp?.toMillis?.() || 0}`}
                   renderItem={({ item }) => {
-                    const ratingValue = item.userRating ?? item.rating;
+                    const rawRatingValue = (item as any).userRating;
+                    const parsedRatingValue =
+                      rawRatingValue === null || rawRatingValue === undefined || rawRatingValue === ""
+                        ? null
+                        : (typeof rawRatingValue === "number" ? rawRatingValue : Number(rawRatingValue));
+                    const ratingValue = (typeof parsedRatingValue === "number" && Number.isFinite(parsedRatingValue))
+                      ? Math.min(10, Math.max(1, parsedRatingValue))
+                      : null;
                     const imageUri = getAlertImageUri(item as MLAlert & { imageUrl?: string });
+                    const alertDeviceName = getAlertDeviceDisplayName(item);
+                    const notificationTypeLabel = getNotificationTypeLabel(item.notificationType);
+                    const detailsLabel = item.detectedObjects?.length
+                      ? item.detectedObjects.join(", ")
+                      : "No detected objects";
+                    const descriptionLabel = item.description?.length
+                      ? item.description.join(" • ")
+                      : "No description";
+                    const riskLabel = item.riskLabel || "Unknown";
+                    const predictedRisk = item.predictedRisk || "Unknown";
+                    const riskDisplay = riskLabel === predictedRisk ? riskLabel : `${riskLabel} (Predicted: ${predictedRisk})`;
+                    const shouldShowImage = notificationTypeLabel.toLowerCase() === "alert" && !!imageUri;
                     const tempPreview = getTemperaturePreview(item);
                     return (
                       <TouchableOpacity style={styles.alertCard} onPress={() => handleRateAlert(item)} activeOpacity={0.86}>
@@ -779,20 +896,22 @@ export default function Dashboard() {
                           <View style={styles.smallDeviceIcon}><MaterialIcons name="router" size={16} color="#1D4ED8" /></View>
                           <View style={styles.alertMetaBlock}>
                             <View style={styles.alertMetaTitleRow}>
-                              <Text numberOfLines={1} style={styles.alertDeviceName}>{item.deviceIdentifier || "raspberrypi-node"}</Text>
-                              <View style={[styles.riskBadge, getRiskStyle(item.riskLabel)]}>
-                                <Text style={styles.riskBadgeText}>{getRiskBadgeLabel(item.riskLabel)}</Text>
-                              </View>
+                              <Text numberOfLines={1} style={styles.alertDeviceName}>{alertDeviceName}</Text>
                             </View>
                             <View style={styles.alertSubRow}>
-                              <MaterialIcons name="visibility" size={13} color="#111827" />
-                              <Text numberOfLines={1} style={styles.alertObjects}>{item.detectedObjects?.join(" ") || "person detected"}</Text>
+                              <Text numberOfLines={1} style={styles.alertObjects}>{notificationTypeLabel} • {detailsLabel}</Text>
+                            </View>
+                            <View style={styles.alertSubRow}>
+                              <Text numberOfLines={1} style={styles.alertObjects}>{descriptionLabel}</Text>
+                            </View>
+                            <View style={styles.alertSubRow}>
+                              <Text numberOfLines={1} style={styles.alertRisk}>Risk: {riskDisplay}</Text>
                             </View>
                           </View>
                         </View>
 
                         <View style={styles.previewWrap}>
-                          {imageUri ? (
+                          {shouldShowImage ? (
                             <Image source={{ uri: imageUri }} style={styles.previewImage} />
                           ) : tempPreview ? (
                             <View style={styles.tempPreviewCard}>
@@ -818,12 +937,34 @@ export default function Dashboard() {
                         </View>
 
                         <View style={styles.alertFooterRow}>
-                          <View style={styles.accuratePill}>
-                            <MaterialIcons name="check-circle" size={13} color="#FFFFFF" />
-                            <Text style={styles.accuratePillText}>
-                              {item.ratingAccuracy === false ? "Inaccurate" : "Accurate"}
-                            </Text>
-                          </View>
+                          {(() => {
+                            const accuracyState = getAlertAccuracyState((item as any).ratingAccuracy);
+                            const pillStyle =
+                              accuracyState === "inaccurate"
+                                ? styles.inaccuratePill
+                                : accuracyState === "unrated"
+                                  ? styles.unratedPill
+                                  : undefined;
+                            const iconName =
+                              accuracyState === "inaccurate"
+                                ? "cancel"
+                                : accuracyState === "unrated"
+                                  ? "help"
+                                  : "check-circle";
+                            const label =
+                              accuracyState === "inaccurate"
+                                ? "Inaccurate"
+                                : accuracyState === "unrated"
+                                  ? "Unrated"
+                                  : "Accurate";
+
+                            return (
+                              <View style={[styles.accuratePill, pillStyle]}>
+                                <MaterialIcons name={iconName} size={13} color="#FFFFFF" />
+                                <Text style={styles.accuratePillText}>{label}</Text>
+                              </View>
+                            );
+                          })()}
                           <View style={styles.timeDotRow}>
                             <View style={styles.timeDot} />
                             <Text style={styles.alertTime}>{formatRelativeTime(item.timestamp)}</Text>
@@ -1043,7 +1184,7 @@ export default function Dashboard() {
                         <TouchableOpacity
                           style={[
                             styles.toggleButton,
-                            sensor.enabled ? styles.activeButton : styles.inactiveButton
+                            sensor.enabled ? styles.turnOffButton : styles.turnOnButton
                           ]}
                           onPress={() => toggleSensorState(sensor)}
                         >
@@ -1081,7 +1222,7 @@ export default function Dashboard() {
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>Rate Alert</Text>
             <Text style={styles.modalSubtitle}>
-              Device: {selectedAlert?.deviceIdentifier}
+              Device: {selectedAlert ? getAlertDeviceDisplayName(selectedAlert) : ''}
             </Text>
 
             {/* Accuracy Selection */}
@@ -1145,12 +1286,8 @@ export default function Dashboard() {
               </TouchableOpacity>
               
               <TouchableOpacity
-                style={[
-                  styles.okButton,
-                  (selectedRating === null || selectedAccuracy === null) && styles.disabledButton
-                ]}
+                style={styles.okButton}
                 onPress={submitRating}
-                disabled={selectedRating === null || selectedAccuracy === null}
               >
                 <Text style={styles.buttonText}>OK</Text>
               </TouchableOpacity>
@@ -1517,6 +1654,12 @@ const styles = StyleSheet.create({
     color: "#3F3F46",
     flex: 1,
   },
+  alertRisk: {
+    fontSize: 12,
+    color: "#7F1D1D",
+    fontWeight: "600",
+    flex: 1,
+  },
   previewWrap: {
     marginTop: 10,
     borderRadius: 8,
@@ -1598,6 +1741,12 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
     fontSize: 10,
     fontWeight: "700",
+  },
+  inaccuratePill: {
+    backgroundColor: "#6B7280",
+  },
+  unratedPill: {
+    backgroundColor: "#9CA3AF",
   },
   timeDotRow: {
     flexDirection: "row",
@@ -1935,11 +2084,11 @@ const styles = StyleSheet.create({
     borderRadius: 6,
     alignItems: "center",
   },
-  activeButton: {
-    backgroundColor: "#10B981",
+  turnOffButton: {
+    backgroundColor: "#DC2626",
   },
-  inactiveButton: {
-    backgroundColor: "#6B7280",
+  turnOnButton: {
+    backgroundColor: "#10B981",
   },
   toggleButtonText: {
     color: "#FFFFFF",
@@ -2019,6 +2168,9 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     borderRadius: 8,
     alignItems: "center",
+  },
+  disabledButton: {
+    opacity: 0.5,
   },
   confirmButton: {
     flex: 1,

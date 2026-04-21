@@ -15,10 +15,12 @@ import {
   arrayUnion,
   arrayRemove,
 } from "firebase/firestore";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { auth, db } from "../firebase/firebaseConfig";
 import { getFunctions, httpsCallable } from "firebase/functions";
 import type { MLAlert } from "../types/mlAlertTypes";
 import { checkDeviceAccess } from "../utils/adminPortalAPI";
+import { io, Socket } from "socket.io-client";
 
 type DeviceDoc = {
   id: string;
@@ -51,6 +53,321 @@ function normalizeAlertRetentionDays(value: any): AlertRetentionDays {
   }
 
   return 30;
+}
+
+const BASE_API_URL = process.env.EXPO_PUBLIC_API_URL || "http://13.205.201.82";
+const ALERT_API_ROOT = (process.env.EXPO_PUBLIC_ALERT_API_URL || `${BASE_API_URL}/alert-api`).replace(/\/$/, "");
+const ALERT_API_BASE = `${ALERT_API_ROOT}/api`;
+const ALERT_SOCKET_PATH = process.env.EXPO_PUBLIC_ALERT_SOCKET_PATH || "/alert-api/socket.io";
+const ALERT_RETENTION_STORAGE_KEY_PREFIX = "alertRetentionDays:";
+const LEGACY_ALERT_RETENTION_STORAGE_KEY = "alertRetentionDays";
+const LOCAL_DELETED_ALERTS_STORAGE_KEY_PREFIX = "deletedMlAlerts:";
+const DEVICE_POLL_INTERVAL_MS = 30000;
+const ALERT_POLL_INTERVAL_MS = 30000;
+const RATE_LIMIT_BACKOFF_MS = 180000;
+
+const localDeviceLabelCache = new Map<string, Record<string, string>>();
+const localDeletedAlertIdsCache = new Map<string, Set<string>>();
+
+function normalizeAlertImageUrl(value: unknown, deviceId?: string): string | null {
+  if (typeof value !== "string") return null;
+
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  const isLoopbackHost = (host: string) => {
+    const normalized = host.toLowerCase();
+    return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+  };
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      const parsed = new URL(trimmed);
+      if (!isLoopbackHost(parsed.hostname)) {
+        return parsed.toString();
+      }
+
+      const publicOrigin = new URL(BASE_API_URL).origin;
+      return `${publicOrigin}${parsed.pathname}${parsed.search}${parsed.hash}`;
+    } catch {
+      return trimmed;
+    }
+  }
+
+  if (trimmed.startsWith('/alert-api/')) {
+    return `${BASE_API_URL.replace(/\/$/, "")}${trimmed}`;
+  }
+
+  if (trimmed.startsWith('/uploads/')) {
+    return `${ALERT_API_ROOT}${trimmed}`;
+  }
+
+  if (trimmed.startsWith('/')) {
+    return `${BASE_API_URL.replace(/\/$/, "")}${trimmed}`;
+  }
+
+  if (trimmed.startsWith('uploads/')) {
+    return `${ALERT_API_ROOT}/${trimmed.replace(/^\/+/, "")}`;
+  }
+
+  if (!trimmed.includes('/')) {
+    const safeDeviceId = encodeURIComponent(String(deviceId || 'unknown-device'));
+    const encodedName = encodeURIComponent(trimmed);
+    return `${ALERT_API_ROOT}/uploads/alerts/${safeDeviceId}/${encodedName}`;
+  }
+
+  return trimmed;
+}
+
+function getLocalDeviceLabelsStorageKey(userId: string) {
+  return `local_device_labels:${userId}`;
+}
+
+async function loadLocalDeviceLabels(userId: string): Promise<Record<string, string>> {
+  if (localDeviceLabelCache.has(userId)) {
+    return localDeviceLabelCache.get(userId)!;
+  }
+
+  try {
+    const raw = await AsyncStorage.getItem(getLocalDeviceLabelsStorageKey(userId));
+    const parsed = raw ? JSON.parse(raw) : {};
+    const labels = (parsed && typeof parsed === "object") ? parsed as Record<string, string> : {};
+    localDeviceLabelCache.set(userId, labels);
+    return labels;
+  } catch {
+    const fallback: Record<string, string> = {};
+    localDeviceLabelCache.set(userId, fallback);
+    return fallback;
+  }
+}
+
+async function saveLocalDeviceLabels(userId: string, labels: Record<string, string>): Promise<void> {
+  localDeviceLabelCache.set(userId, labels);
+  await AsyncStorage.setItem(getLocalDeviceLabelsStorageKey(userId), JSON.stringify(labels));
+}
+
+async function applyLocalLabelsToDevices(userId: string, devices: DeviceDoc[]): Promise<DeviceDoc[]> {
+  const labels = await loadLocalDeviceLabels(userId);
+  return devices.map((device) => {
+    const localLabel = labels[device.id];
+    if (!localLabel) return device;
+    return {
+      ...device,
+      label: localLabel,
+      userLabel: localLabel,
+    };
+  });
+}
+
+function getDeletedAlertsStorageKey(userId: string) {
+  return `${LOCAL_DELETED_ALERTS_STORAGE_KEY_PREFIX}${userId}`;
+}
+
+async function loadDeletedAlertIds(userId: string): Promise<Set<string>> {
+  if (localDeletedAlertIdsCache.has(userId)) {
+    return localDeletedAlertIdsCache.get(userId)!;
+  }
+
+  try {
+    const raw = await AsyncStorage.getItem(getDeletedAlertsStorageKey(userId));
+    const parsed = raw ? JSON.parse(raw) : [];
+    const set = new Set<string>(Array.isArray(parsed) ? parsed.map((value) => String(value)) : []);
+    localDeletedAlertIdsCache.set(userId, set);
+    return set;
+  } catch {
+    const fallback = new Set<string>();
+    localDeletedAlertIdsCache.set(userId, fallback);
+    return fallback;
+  }
+}
+
+async function saveDeletedAlertIds(userId: string, ids: Set<string>): Promise<void> {
+  localDeletedAlertIdsCache.set(userId, ids);
+  await AsyncStorage.setItem(getDeletedAlertsStorageKey(userId), JSON.stringify(Array.from(ids)));
+}
+
+function asStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item) => item !== undefined && item !== null).map((item) => String(item));
+  }
+
+  if (value === undefined || value === null || value === "") {
+    return [];
+  }
+
+  return [String(value)];
+}
+
+function toMillis(value: unknown): number {
+  if (!value) return 0;
+
+  if (typeof value === "number") return value;
+
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+
+  if (typeof value === "object" && value !== null && "toMillis" in value && typeof (value as any).toMillis === "function") {
+    return (value as any).toMillis();
+  }
+
+  return 0;
+}
+
+function createPseudoTimestamp(value: unknown) {
+  const millis = toMillis(value);
+  return {
+    toMillis: () => millis,
+    toDate: () => new Date(millis),
+  };
+}
+
+function isRateLimitError(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error || "")).toLowerCase();
+  return message.includes("too many requests") || message.includes("429");
+}
+
+async function getAuthHeader(): Promise<Record<string, string>> {
+  const user = auth.currentUser;
+  if (!user) return {};
+  try {
+    const token = await user.getIdToken();
+    return { Authorization: `Bearer ${token}` };
+  } catch {
+    return {};
+  }
+}
+
+async function alertApiRequest<T = any>(path: string, options: RequestInit = {}): Promise<T> {
+  const authHeader = await getAuthHeader();
+  const response = await fetch(`${ALERT_API_BASE}${path}`, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeader,
+      ...(options.headers || {}),
+    },
+  });
+
+  const text = await response.text();
+  let payload: any = {};
+
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { message: text };
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(payload?.error || payload?.message || `Alert API request failed: ${response.status}`);
+  }
+
+  return (payload ?? {}) as T;
+}
+
+function mapEc2AlertToMLAlert(input: any, fallbackUserId: string): MLAlert {
+  const generatedAt = toMillis(input?.alertGeneratedAt || input?.alert_generated_at || input?.timestamp || input?.created_at);
+  const rawUserRating = input?.userRating ?? input?.user_rating ?? input?.ratingScore ?? input?.rating_score ?? input?.rating ?? null;
+  const parsedUserRating =
+    rawUserRating === null || rawUserRating === undefined || rawUserRating === ""
+      ? null
+      : Number(rawUserRating);
+  const normalizedUserRating = Number.isFinite(parsedUserRating)
+    ? Math.min(10, Math.max(1, parsedUserRating))
+    : null;
+  const normalizedAccuracy =
+    input?.ratingAccuracy ??
+    input?.rating_accuracy ??
+    input?.isAccurate ??
+    input?.is_accurate ??
+    null;
+  const normalizedScreenshots = asStringArray(input?.screenshots || input?.screenshot)
+    .map((item) => normalizeAlertImageUrl(item, input?.deviceId || input?.device_id))
+    .filter((item): item is string => Boolean(item));
+
+  return {
+    id: String(input?.id || input?.alertId || ""),
+    deviceId: String(input?.deviceId || input?.device_id || ""),
+    deviceIdentifier: String(input?.deviceIdentifier || input?.device_identifier || input?.deviceId || "Unknown Device"),
+    userId: String(input?.userId || input?.user_id || fallbackUserId),
+    notificationType: String(input?.notificationType || input?.notification_type || "Alert"),
+    detectedObjects: asStringArray(input?.detectedObjects || input?.detected_objects || input?.detectedCondition || input?.detected_condition),
+    riskLabel: String(input?.riskLabel || input?.risk_label || "Unknown"),
+    predictedRisk: String(input?.predictedRisk || input?.predicted_risk || input?.riskLabel || input?.risk_label || "Unknown"),
+    description: asStringArray(input?.description),
+    screenshots: normalizedScreenshots,
+    timestamp: createPseudoTimestamp(input?.timestamp || input?.created_at || generatedAt),
+    alertGeneratedAt: generatedAt,
+    modelVersion: input?.modelVersion || input?.model_version,
+    confidenceScore: input?.confidenceScore ?? input?.confidence_score ?? null,
+    acknowledged: input?.acknowledged === true,
+    userRating: normalizedUserRating,
+    ratingAccuracy: normalizedAccuracy,
+    additionalData: input?.additionalData || input?.additional_data || {},
+  };
+}
+
+async function fetchEc2UserAlerts(userId: string, sinceMillis?: number, limit = 200): Promise<MLAlert[]> {
+  const params = new URLSearchParams();
+  params.set("limit", String(limit));
+
+  if (sinceMillis && sinceMillis > 0) {
+    params.set("since", new Date(sinceMillis).toISOString());
+  }
+
+  const result = await alertApiRequest<{ alerts?: any[] }>(`/alerts/user/${encodeURIComponent(userId)}?${params.toString()}`);
+  const alerts = Array.isArray(result?.alerts) ? result.alerts : [];
+
+  return alerts
+    .map((item) => mapEc2AlertToMLAlert(item, userId))
+    .sort((a, b) => {
+      const aTime = a.alertGeneratedAt || a.timestamp?.toMillis?.() || 0;
+      const bTime = b.alertGeneratedAt || b.timestamp?.toMillis?.() || 0;
+      return bTime - aTime;
+    });
+}
+
+function mapEc2DeviceToDeviceDoc(input: any, fallbackUserId: string | null = null): DeviceDoc {
+  const id = String(input?.id || input?.deviceId || input?.device_id || "");
+  const userId = input?.userId || input?.user_id || fallbackUserId || null;
+  const userIds = Array.isArray(input?.userIds)
+    ? input.userIds.map((value: any) => String(value))
+    : (userId ? [String(userId)] : []);
+
+  return {
+    id,
+    label: String(input?.label || input?.userLabel || input?.deviceName || input?.name || input?.location || id),
+    sharedLabel: String(input?.label || input?.deviceName || input?.name || input?.location || id),
+    name: String(input?.name || input?.deviceName || input?.location || id),
+    userId: userId ? String(userId) : null,
+    userIds,
+    active: input?.active !== false,
+    createdAt: input?.createdAt || input?.created_at || null,
+    lastSeen: input?.lastSeen || input?.last_seen || null,
+    claimedAt: input?.claimedAt || input?.claimed_at || input?.added_at || null,
+    userLabel: input?.userLabel || input?.user_label || null,
+    location: input?.location || null,
+    ...input,
+  };
+}
+
+async function fetchEc2UserDevices(userId: string): Promise<DeviceDoc[]> {
+  const result = await alertApiRequest<{ devices?: any[] }>("/devices/user");
+  const devices = Array.isArray(result?.devices) ? result.devices : [];
+
+  const mapped = devices.map((item) => mapEc2DeviceToDeviceDoc(item, userId));
+  return applyLocalLabelsToDevices(userId, mapped);
+}
+
+async function fetchEc2AvailableDevices(userId: string): Promise<DeviceDoc[]> {
+  const result = await alertApiRequest<{ devices?: any[] }>("/devices/available");
+  const devices = Array.isArray(result?.devices) ? result.devices : [];
+
+  const mapped = devices.map((item) => mapEc2DeviceToDeviceDoc(item, null));
+  return applyLocalLabelsToDevices(userId, mapped);
 }
 
 function normalizeDeviceDoc(deviceId: string, data: Record<string, any>): DeviceDoc {
@@ -126,10 +443,6 @@ function userHasDeviceMembership(device: Partial<DeviceDoc>, userId: string) {
  *   - createdAt: timestamp
  *   - lastSeen: timestamp
  * 
- * - devices/{deviceId}/readings/{readingId}
- *   - value: number
- *   - timestamp: timestamp
- * 
  * - devices/{deviceId}/alerts/{alertId}
  *   - type: string
  *   - message: string
@@ -142,13 +455,8 @@ function userHasDeviceMembership(device: Partial<DeviceDoc>, userId: string) {
  *   - userId: string (owner)
  *   - unit?: string
  *   - description?: string
- *   - alertThreshold?: { min: number, max: number }
  *   - createdAt: timestamp
  *   - updatedAt: timestamp
- * 
- * - sensors/{sensorId}/readings/{readingId}
- *   - value: number
- *   - timestamp: timestamp
  * 
  * - users/{userId}
  *   - email: string
@@ -169,96 +477,44 @@ function userHasDeviceMembership(device: Partial<DeviceDoc>, userId: string) {
 export const listenToUserDevices = (callback: (devices: any[]) => void) => {
   const user = auth.currentUser;
   if (!user) {
-    console.error("[Firestore] No user authenticated");
-    callback([]); // Call with empty array immediately
-    return () => {};
-  }
-
-  console.log("[Firestore] Setting up real-time listener for devices for user:", user.uid);
-
-  const devicesRef = collection(db, "devices");
-  const userDevicesRef = collection(db, "users", user.uid, "devices");
-  let latestDevices: DeviceDoc[] = [];
-  let latestUserProfiles = new Map<string, UserDeviceProfileDoc>();
-  let hasDevicesSnapshot = false;
-  let hasProfilesSnapshot = false;
-
-  const emitMergedDevices = () => {
-    if (!hasDevicesSnapshot || !hasProfilesSnapshot) {
-      return;
-    }
-
-    const mergedDevices = mergeDevicesWithUserProfiles(latestDevices, latestUserProfiles);
-
-    console.log("[Firestore] User devices found:", mergedDevices.length);
-    if (mergedDevices.length === 0) {
-      console.log("[Firestore] ⚠️ No devices found for userId:", user.uid);
-    } else {
-      console.log("[Firestore] ✅ Found devices:", mergedDevices.map((d) => `${d.id}:${d.label || d.name || 'Unnamed'}`).join(", "));
-    }
-
-    callback(mergedDevices);
-  };
-  
-  console.log("[Firestore] Query created, attaching listener...");
-
-  try {
-    const unsubscribeDevices = onSnapshot(
-      devicesRef,
-      {
-        next: (snapshot) => {
-          console.log("[Firestore] ✅ Devices snapshot received! Size:", snapshot.size);
-          latestDevices = snapshot.docs
-            .map((doc) => {
-              const normalized = normalizeDeviceDoc(doc.id, doc.data());
-              console.log("[Firestore] Device doc:", doc.id, "userId:", normalized.userId, "userIds:", normalized.userIds);
-              return normalized;
-            })
-            .filter((device) => userHasDeviceMembership(device, user.uid));
-
-          hasDevicesSnapshot = true;
-          emitMergedDevices();
-        },
-        error: (error) => {
-          console.error("[Firestore] ❌ Devices listener error:", error);
-          console.error("[Firestore] Error code:", error.code);
-          console.error("[Firestore] Error message:", error.message);
-          callback([]); // Call with empty array on error
-        }
-      }
-    );
-
-    const unsubscribeProfiles = onSnapshot(
-      userDevicesRef,
-      {
-        next: (snapshot) => {
-          latestUserProfiles = new Map(
-            snapshot.docs.map((profileDoc) => {
-              const normalizedProfile = normalizeUserDeviceProfile(profileDoc.id, profileDoc.data());
-              return [profileDoc.id, normalizedProfile];
-            })
-          );
-
-          hasProfilesSnapshot = true;
-          emitMergedDevices();
-        },
-        error: (error) => {
-          console.error("[Firestore] ❌ User device profile listener error:", error);
-          callback([]);
-        }
-      }
-    );
-
-    console.log("[Firestore] Listener attached successfully");
-    return () => {
-      unsubscribeDevices();
-      unsubscribeProfiles();
-    };
-  } catch (err) {
-    console.error("[Firestore] Exception attaching listener:", err);
+    console.error("[Alerts] No user authenticated");
     callback([]);
     return () => {};
   }
+
+  let isClosed = false;
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let nextPollAllowedAt = 0;
+
+  const pollDevices = async () => {
+    if (isClosed) return;
+    if (Date.now() < nextPollAllowedAt) return;
+
+    try {
+      const devices = await fetchEc2UserDevices(user.uid);
+      callback(devices);
+      nextPollAllowedAt = 0;
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        nextPollAllowedAt = Date.now() + RATE_LIMIT_BACKOFF_MS;
+        console.warn("[Alerts] Device polling rate-limited; backing off for 60s.");
+        return;
+      }
+
+      console.error("[Alerts] Error polling user devices:", error);
+    }
+  };
+
+  pollDevices();
+  pollTimer = setInterval(pollDevices, DEVICE_POLL_INTERVAL_MS);
+
+  return () => {
+    isClosed = true;
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  };
 };
 
 /**
@@ -269,25 +525,9 @@ export async function getUserDevices() {
   if (!userId) throw new Error("User not authenticated");
 
   try {
-    const [devicesSnapshot, userProfilesSnapshot] = await Promise.all([
-      getDocs(collection(db, "devices")),
-      getDocs(collection(db, "users", userId, "devices")),
-    ]);
-
-    const userProfiles = new Map(
-      userProfilesSnapshot.docs.map((profileDoc) => [
-        profileDoc.id,
-        normalizeUserDeviceProfile(profileDoc.id, profileDoc.data()),
-      ])
-    );
-
-    const devices = devicesSnapshot.docs
-      .map((doc) => normalizeDeviceDoc(doc.id, doc.data()))
-      .filter((device) => userHasDeviceMembership(device, userId));
-
-    return mergeDevicesWithUserProfiles(devices, userProfiles);
+    return await fetchEc2UserDevices(userId);
   } catch (error) {
-    console.error("[Firestore] Error getting devices:", error);
+    console.error("[Alerts] Error getting user devices:", error);
     throw error;
   }
 }
@@ -354,13 +594,16 @@ export async function updateDeviceLabel(
     const userId = auth.currentUser?.uid;
     if (!userId) throw new Error("No user authenticated");
 
-    await setDoc(getUserDeviceProfileRef(userId, deviceId), {
-      label: label,
-      updatedAt: serverTimestamp(),
-    }, { merge: true });
-    console.log("[Firestore] Device label updated:", deviceId);
+    const trimmed = label.trim();
+    if (!trimmed) throw new Error("Label cannot be empty");
+
+    const labels = await loadLocalDeviceLabels(userId);
+    labels[deviceId] = trimmed;
+    await saveLocalDeviceLabels(userId, labels);
+
+    console.log("[Local] Device label updated for this app profile:", deviceId);
   } catch (error) {
-    console.error("[Firestore] Error updating device label:", error);
+    console.error("[Local] Error updating device label:", error);
     throw error;
   }
 }
@@ -411,117 +654,20 @@ export async function deleteDevice(deviceId: string) {
 }
 
 /**
- * Add device reading/data point
- */
-export async function addDeviceReading(
-  deviceId: string,
-  reading: {
-    value: number;
-    timestamp?: Date;
-  }
-) {
-  try {
-    const docRef = await addDoc(
-      collection(db, "devices", deviceId, "readings"),
-      {
-        ...reading,
-        timestamp: reading.timestamp || serverTimestamp(),
-      }
-    );
-    console.log("[Firestore] Device reading added:", docRef.id);
-    return docRef.id;
-  } catch (error) {
-    console.error("[Firestore] Error adding device reading:", error);
-    throw error;
-  }
-}
-
-/**
- * Listen to device readings in real-time
- */
-export async function listenToDeviceReadings(
-  deviceId: string,
-  callback: (readings: any[]) => void,
-  limit: number = 100
-) {
-  try {
-    const userId = auth.currentUser?.uid;
-    if (!userId) {
-      console.error("[Firestore] No authenticated user");
-      return () => {};
-    }
-
-    // 🔐 Skip access control check on every poll - already validated when device was claimed
-    // const { hasAccess, reason } = await checkDeviceAccess(userId, deviceId);
-    // if (!hasAccess) {
-    //   console.warn(`[Access Control] User ${userId} denied access to device ${deviceId}: ${reason}`);
-    //   callback([]);
-    //   return () => {};
-    // }
-
-    const q = query(
-      collection(db, "devices", deviceId, "readings")
-    );
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const readings = (snapshot.docs
-        .map((doc) => ({
-          id: doc.id,
-          ...doc.data(),
-        })) as Array<{ id: string; timestamp?: any; [key: string]: any }>)
-        .sort((a, b) => {
-          const timeA = a.timestamp?.toMillis?.() || 0;
-          const timeB = b.timestamp?.toMillis?.() || 0;
-          return timeB - timeA;
-        })
-        .slice(0, limit);
-
-      callback(readings);
-    }, (error: any) => {
-      // Silently ignore permission errors (happens when user logs out)
-      if (error?.code === "permission-denied") {
-        console.log("[Firestore] Readings listener: Permission denied (user may be logged out)");
-        return;
-      }
-      console.error("[Firestore] Readings listener error:", error);
-    });
-
-    return unsubscribe;
-  } catch (error) {
-    console.error("[Firestore] Error setting up readings listener:", error);
-    return () => {};
-  }
-}
-
-/**
  * Get ALL devices from Firestore (for device selection)
  * Updated for shared device access - looks for devices with userIds arrays
  */
 export async function getAllAvailableDevices() {
   try {
-    console.log("[Firestore] Querying all devices...");
-    
-    // Get all devices (don't filter by active in query as some devices might not have this field yet)
-    const querySnapshot = await getDocs(collection(db, "devices"));
-    
-    const devices = querySnapshot.docs.map((doc) => {
-      return normalizeDeviceDoc(doc.id, doc.data());
-    }).filter(device => {
-      // Filter active devices and devices with proper structure
-      const isActive = device.active !== false;
-      const hasLabel = Boolean(device.label || device.name);
-      console.log(`[Firestore] Device ${device.id}: label="${device.label}", active=${isActive}, hasLabel=${hasLabel}`);
-      return isActive && hasLabel;
-    });
-    
-    console.log("[Firestore] Found available devices:", devices.length);
-    devices.forEach(device => {
-      console.log(`[Firestore] Available device ${device.id}: label="${device.label}", userIds=${JSON.stringify(device.userIds)}, userId="${device.userId || 'null'}"`);
-    });
-    
+    const userId = auth.currentUser?.uid;
+    if (!userId) throw new Error("User not authenticated");
+
+    const devices = await fetchEc2AvailableDevices(userId);
+    console.log("[Alerts] Found available devices:", devices.length);
+
     return devices;
   } catch (error) {
-    console.error("[Firestore] Error getting all devices:", error);
+    console.error("[Alerts] Error getting all devices:", error);
     throw error;
   }
 }
@@ -535,9 +681,9 @@ export async function getAvailableDevicesForUser() {
   if (!userId) throw new Error("User not authenticated");
 
   try {
-    console.log("[Firestore] Getting available devices for user:", userId);
+    console.log("[Alerts] Getting available devices for user:", userId);
     const allDevices = await getAllAvailableDevices();
-    console.log("[Firestore] All active devices from Firestore:", allDevices.length);
+    console.log("[Alerts] All active devices from EC2:", allDevices.length);
     
     // Filter devices based on shared access logic
     const available = allDevices.filter((device) => {
@@ -545,30 +691,23 @@ export async function getAvailableDevicesForUser() {
       const label = (device.label || "").toLowerCase();
       const name = (device.name || "").toLowerCase();
       if (label.includes("test device") || name.includes("test")) {
-        console.log("[Firestore] Excluding test device:", device.id, device.label);
+        console.log("[Alerts] Excluding test device:", device.id, device.label);
         return false;
       }
 
       // Must have valid label/name and id
       if (!(device.label || device.name) || !device.id) {
-        console.log("[Firestore] Excluding device with missing label/id:", device.id);
+        console.log("[Alerts] Excluding device with missing label/id:", device.id);
         return false;
       }
 
-      // Check membership using both shared and legacy fields.
-      const userIds = Array.isArray(device.userIds) ? device.userIds : [];
-      const alreadyClaimed = userHasDeviceMembership(device, userId);
-      
-      console.log(`[Firestore] Device ${device.id} (${device.label}): userId=${device.userId || 'null'}, userIds=[${userIds.join(', ')}], alreadyClaimed=${alreadyClaimed}`);
-      
-      // Available if user hasn't claimed it yet
-      return !alreadyClaimed;
+      return true;
     });
 
-    console.log("[Firestore] Available devices for user to claim:", available.length);
+    console.log("[Alerts] Available devices for user to claim:", available.length);
     return available;
   } catch (error) {
-    console.error("[Firestore] Error getting available devices:", error);
+    console.error("[Alerts] Error getting available devices:", error);
     throw error;
   }
 }
@@ -582,27 +721,17 @@ export async function claimDevice(deviceId: string) {
   if (!user) throw new Error("No user authenticated");
 
   try {
-    const deviceSnapshot = await getDoc(doc(db, "devices", deviceId));
-    const deviceData = deviceSnapshot.data() || {};
-
-    await updateDoc(doc(db, "devices", deviceId), {
-      // Keep legacy userId for backward compatibility (first user or most recent)
-      userId: user.uid,
-      // Add user to shared access array (multiple users can claim same device)
-      userIds: arrayUnion(user.uid),
-      claimedAt: serverTimestamp(),
+    await alertApiRequest("/device-memberships/add", {
+      method: "POST",
+      body: JSON.stringify({
+        deviceId,
+      }),
     });
 
-    await setDoc(getUserDeviceProfileRef(user.uid, deviceId), {
-      label: deviceData.label || deviceData.name || deviceId,
-      claimedAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    }, { merge: true });
-
-    console.log("[Firestore] Device claimed:", deviceId, "by user:", user.uid);
+    console.log("[Alerts] Device membership added:", deviceId, "for user:", user.uid);
     return deviceId;
   } catch (error) {
-    console.error("[Firestore] Error claiming device:", error);
+    console.error("[Alerts] Error adding device membership:", error);
     throw error;
   }
 }
@@ -616,30 +745,17 @@ export async function unclaimDevice(deviceId: string) {
   if (!user) throw new Error("No user authenticated");
 
   try {
-    // Remove user from shared access array
-    await updateDoc(doc(db, "devices", deviceId), {
-      userIds: arrayRemove(user.uid),
+    await alertApiRequest("/device-memberships/remove", {
+      method: "POST",
+      body: JSON.stringify({
+        deviceId,
+      }),
     });
 
-    await deleteDoc(getUserDeviceProfileRef(user.uid, deviceId));
-    
-    // Keep legacy userId aligned with one remaining member when possible.
-    const deviceDoc = await getDoc(doc(db, "devices", deviceId));
-    const deviceData = deviceDoc.data();
-    if (deviceData?.userId === user.uid) {
-      const remainingUserIds = Array.isArray(deviceData?.userIds)
-        ? deviceData.userIds.filter((memberId: string) => memberId !== user.uid)
-        : [];
-
-      await updateDoc(doc(db, "devices", deviceId), {
-        userId: remainingUserIds[0] || null,
-      });
-    }
-    
-    console.log("[Firestore] Device unclaimed:", deviceId, "by user:", user.uid);
+    console.log("[Alerts] Device membership removed:", deviceId, "for user:", user.uid);
     return deviceId;
   } catch (error) {
-    console.error("[Firestore] Error unclaiming device:", error);
+    console.error("[Alerts] Error removing device membership:", error);
     throw error;
   }
 }
@@ -939,20 +1055,20 @@ export function listenToDeviceMLAlerts(
  * Get all ML alerts from all user's devices
  */
 export async function getUserMLAlerts(limit: number = 100): Promise<MLAlert[]> {
+  const user = auth.currentUser;
+  if (!user) throw new Error("User not authenticated");
+
   try {
-    const user = auth.currentUser;
-    if (!user) throw new Error("User not authenticated");
+    const alerts = await fetchEc2UserAlerts(user.uid, undefined, limit);
+    console.log("[Alerts] getUserMLAlerts: fetched", alerts.length, "alerts from EC2 API");
+    return alerts;
+  } catch (apiError) {
+    console.warn("[Alerts] EC2 getUserMLAlerts failed, falling back to Firestore:", apiError);
 
-    console.log("[Firestore] getUserMLAlerts: Fetching for user", user.uid);
-
-    // Alerts are stored in users/{userId}/mlAlerts collection (by Cloud Function)
-    // NOT in devices/{deviceId}/alerts
-    const q = query(
-      collection(db, "users", user.uid, "mlAlerts")
-    );
-
+    const q = query(collection(db, "users", user.uid, "mlAlerts"));
     const snapshot = await getDocs(q);
-    const allAlerts = snapshot.docs
+
+    return snapshot.docs
       .map((doc) => ({
         id: doc.id,
         ...doc.data(),
@@ -963,17 +1079,6 @@ export async function getUserMLAlerts(limit: number = 100): Promise<MLAlert[]> {
         return timeB - timeA;
       })
       .slice(0, limit);
-
-    console.log("[Firestore] getUserMLAlerts: Found", allAlerts.length, "alerts in users collection");
-    return allAlerts;
-  } catch (error) {
-    // Don't log auth errors as ERROR - they're expected during logout
-    if (error instanceof Error && error.message === "User not authenticated") {
-      console.log("[Firestore] getUserMLAlerts: User not authenticated (expected during logout)");
-    } else {
-      console.error("[Firestore] Error getting user ML alerts:", error);
-    }
-    throw error;
   }
 }
 
@@ -981,51 +1086,189 @@ export async function getUserMLAlerts(limit: number = 100): Promise<MLAlert[]> {
  * Listen to ML alerts from all user devices in real-time
  */
 export function listenToUserMLAlerts(callback: (alerts: MLAlert[]) => void): () => void {
-  try {
-    const user = auth.currentUser;
-    if (!user) {
-      console.error("[Firestore] No user authenticated for ML alerts");
-      callback([]); // Call with empty array immediately
-      return () => {};
-    }
-
-    console.log("[Firestore] Setting up listener for user ML alerts from users/{userId}/mlAlerts");
-
-    // Listen to user-level mlAlerts collection (from Cloud Functions)
-    const q = query(
-      collection(db, "users", user.uid, "mlAlerts")
-    );
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const alerts = snapshot.docs
-        .map((doc) => ({
-          id: doc.id,
-          ...doc.data(),
-        } as MLAlert))
-        .sort((a, b) => {
-          const timeA = a.timestamp?.toMillis?.() || 0;
-          const timeB = b.timestamp?.toMillis?.() || 0;
-          return timeB - timeA;
-        });
-
-      console.log("[Firestore] User ML alerts snapshot received:", alerts.length, "alerts");
-      callback(alerts);
-    }, (error: any) => {
-      if (error?.code === "permission-denied") {
-        console.warn("[Firestore] ML alerts listener: Permission denied");
-        callback([]); // Call with empty array
-        return;
-      }
-      console.error("[Firestore] ML alerts listener error:", error);
-      callback([]); // Call with empty array on error
-    });
-
-    return unsubscribe;
-  } catch (error) {
-    console.error("[Firestore] Error setting up user ML alerts listener:", error);
-    callback([]); // Call with empty array
+  const user = auth.currentUser;
+  if (!user) {
+    callback([]);
     return () => {};
   }
+
+  let isClosed = false;
+  let socket: Socket | null = null;
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let inFlightPoll = false;
+  let lastSeenMillis = 0;
+  let alertMap = new Map<string, MLAlert>();
+  let deletedAlertIds = new Set<string>();
+  let socketConnectErrorCount = 0;
+  let socketDisabledForSession = false;
+  let nextPollAllowedAt = 0;
+
+  const emit = () => {
+    const alerts = Array.from(alertMap.values())
+      .filter((alert) => !alert.id || !deletedAlertIds.has(alert.id))
+      .sort((a, b) => {
+      const aTime = a.alertGeneratedAt || a.timestamp?.toMillis?.() || 0;
+      const bTime = b.alertGeneratedAt || b.timestamp?.toMillis?.() || 0;
+      return bTime - aTime;
+    });
+
+    callback(alerts);
+  };
+
+  const mergeAlerts = (incoming: MLAlert[]) => {
+    incoming.forEach((alert) => {
+      if (!alert.id) {
+        return;
+      }
+
+      const existing = alertMap.get(alert.id);
+      if (!existing) {
+        alertMap.set(alert.id, alert);
+      } else {
+        alertMap.set(alert.id, { ...existing, ...alert });
+      }
+
+      const alertTime = alert.alertGeneratedAt || alert.timestamp?.toMillis?.() || 0;
+      if (alertTime > lastSeenMillis) {
+        lastSeenMillis = alertTime;
+      }
+    });
+  };
+
+  const poll = async (fullRefresh = false) => {
+    if (isClosed || inFlightPoll) {
+      return;
+    }
+
+    if (Date.now() < nextPollAllowedAt) {
+      return;
+    }
+
+    inFlightPoll = true;
+    try {
+      const since = fullRefresh ? undefined : lastSeenMillis;
+      const fetched = await fetchEc2UserAlerts(user.uid, since, 200);
+
+      if (fullRefresh) {
+        alertMap = new Map();
+      }
+
+      mergeAlerts(fetched);
+      emit();
+      nextPollAllowedAt = 0;
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        nextPollAllowedAt = Date.now() + RATE_LIMIT_BACKOFF_MS;
+        console.warn("[Alerts] Alert polling rate-limited; backing off for 60s.");
+        return;
+      }
+
+      console.warn("[Alerts] EC2 poll failed:", error);
+      if (fullRefresh) callback([]);
+    } finally {
+      inFlightPoll = false;
+    }
+  };
+
+  // Initialize local deletion set, then fetch initial state.
+  loadDeletedAlertIds(user.uid)
+    .then((ids) => {
+      deletedAlertIds = ids;
+    })
+    .catch(() => {
+      deletedAlertIds = new Set<string>();
+    })
+    .finally(() => {
+      poll(true);
+    });
+
+  // Polling fallback is always on (network resilience).
+  pollTimer = setInterval(() => {
+    poll(false);
+  }, ALERT_POLL_INTERVAL_MS);
+
+  // WebSocket realtime channel — token fetched async before connecting.
+  user.getIdToken().then((idToken) => {
+    if (isClosed) return;
+    socket = io(ALERT_API_ROOT, {
+      auth: { token: idToken },
+      path: ALERT_SOCKET_PATH,
+      transports: ["websocket", "polling"],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 15000,
+    });
+
+    socket.io.on("reconnect_attempt", async () => {
+      if (!socket) {
+        return;
+      }
+
+      try {
+        const refreshed = await user.getIdToken(true);
+        if (socket) {
+          socket.auth = { token: refreshed };
+        }
+      } catch (refreshError) {
+        console.warn("[Alerts] Failed to refresh WebSocket auth token:", refreshError);
+      }
+    });
+
+    socket.on("connect", () => {
+      socketConnectErrorCount = 0;
+      console.log("[Alerts] WebSocket connected for user", user.uid);
+    });
+
+    socket.on("alert:new", (payload: any) => {
+      const alert = mapEc2AlertToMLAlert(payload, user.uid);
+      mergeAlerts([alert]);
+      emit();
+    });
+
+    socket.on("disconnect", (reason) => {
+      console.log("[Alerts] WebSocket disconnected:", reason);
+    });
+
+    socket.on("connect_error", (error) => {
+      socketConnectErrorCount += 1;
+
+      if (socketConnectErrorCount <= 2) {
+        console.warn("[Alerts] WebSocket connect error:", error?.message || error);
+      }
+
+      // Circuit-breaker: after repeated failures, stop realtime socket retries
+      // and rely on the existing polling fallback to avoid log spam.
+      if (socketConnectErrorCount >= 3 && !socketDisabledForSession) {
+        socketDisabledForSession = true;
+        console.warn("[Alerts] Disabling WebSocket for this session after repeated failures; using polling fallback.");
+
+        if (socket) {
+          socket.removeAllListeners();
+          socket.disconnect();
+          socket = null;
+        }
+      }
+    });
+  }).catch((tokenErr) => {
+    console.warn("[Alerts] Could not get Firebase ID token for WebSocket:", tokenErr);
+  });
+
+  return () => {
+    isClosed = true;
+
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+
+    if (socket) {
+      socket.removeAllListeners();
+      socket.disconnect();
+      socket = null;
+    }
+  };
 }
 
 /**
@@ -1035,10 +1278,18 @@ export async function getUserAlertRetentionDays(): Promise<AlertRetentionDays> {
   const user = auth.currentUser;
   if (!user) throw new Error("User not authenticated");
 
-  const userRef = doc(db, "users", user.uid);
-  const userSnapshot = await getDoc(userRef);
+  const scopedKey = `${ALERT_RETENTION_STORAGE_KEY_PREFIX}${user.uid}`;
+  const [scopedValue, legacyValue] = await Promise.all([
+    AsyncStorage.getItem(scopedKey),
+    AsyncStorage.getItem(LEGACY_ALERT_RETENTION_STORAGE_KEY),
+  ]);
 
-  return normalizeAlertRetentionDays(userSnapshot.data()?.alertRetentionDays);
+  const candidate = scopedValue ?? legacyValue;
+  if (candidate === null) {
+    return 7;
+  }
+
+  return normalizeAlertRetentionDays(parseInt(candidate, 10));
 }
 
 /**
@@ -1048,18 +1299,17 @@ export async function saveUserAlertRetentionDays(days: AlertRetentionDays): Prom
   const user = auth.currentUser;
   if (!user) throw new Error("User not authenticated");
 
-  await setDoc(
-    doc(db, "users", user.uid),
-    {
-      alertRetentionDays: normalizeAlertRetentionDays(days),
-      alertRetentionUpdatedAt: serverTimestamp(),
-    },
-    { merge: true }
-  );
+  const normalized = normalizeAlertRetentionDays(days);
+  const scopedKey = `${ALERT_RETENTION_STORAGE_KEY_PREFIX}${user.uid}`;
+  await AsyncStorage.multiSet([
+    [scopedKey, normalized.toString()],
+    [LEGACY_ALERT_RETENTION_STORAGE_KEY, normalized.toString()],
+  ]);
 }
 
 /**
- * Update ML alert with user feedback/rating
+ * Update ML alert with user feedback/rating.
+ * Writes to EC2 alert API first; falls back to Firestore for backwards compat.
  */
 export async function updateMLAlertRating(
   alertId: string,
@@ -1067,30 +1317,49 @@ export async function updateMLAlertRating(
   isAccurate?: boolean,
   notes?: string
 ): Promise<void> {
-  try {
-    const user = auth.currentUser;
-    if (!user) throw new Error("User not authenticated");
+  const user = auth.currentUser;
+  if (!user) throw new Error("User not authenticated");
 
-    // Update in user-level mlAlerts collection
+  // ── EC2 primary path ─────────────────────────────────────────────────────
+  const authHeader = await getAuthHeader();
+  try {
+    const res = await fetch(`${ALERT_API_BASE}/alerts/${encodeURIComponent(alertId)}/rating`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', ...authHeader },
+      body: JSON.stringify({
+        rating,
+        isAccurate,
+        notes,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      console.warn('[EC2] Alert rating update failed:', res.status, body);
+    } else {
+      console.log('[EC2] ML alert rating updated:', alertId);
+      return; // success — skip Firestore fallback
+    }
+  } catch (ec2Err) {
+    console.warn('[EC2] Alert rating unreachable, falling back to Firestore:', ec2Err);
+  }
+
+  // ── Firestore fallback ────────────────────────────────────────────────────
+  try {
     const alertRef = doc(db, "users", user.uid, "mlAlerts", alertId);
-    
-    // Check if document exists first
     const docSnapshot = await getDoc(alertRef);
     if (!docSnapshot.exists()) {
       console.warn("[Firestore] Alert document not found:", alertId);
       return;
     }
-
     await updateDoc(alertRef, {
-      userRating: Math.min(10, Math.max(1, rating)), // Clamp 1-10
+      userRating: Math.min(10, Math.max(1, rating)),
       ratingAccuracy: isAccurate !== undefined ? isAccurate : null,
       ratingNotes: notes || null,
       ratedAt: serverTimestamp(),
       acknowledged: true,
       acknowledgedAt: serverTimestamp(),
     });
-
-    console.log("[Firestore] ML alert rating updated:", alertId);
+    console.log("[Firestore] ML alert rating updated (fallback):", alertId);
   } catch (error) {
     console.error("[Firestore] Error updating ML alert rating:", error);
     throw error;
@@ -1101,25 +1370,26 @@ export async function updateMLAlertRating(
  * Acknowledge an ML alert
  */
 export async function acknowledgeMLAlert(
-  deviceId: string,
+  _deviceId: string,
   alertId: string
 ): Promise<void> {
+  const user = auth.currentUser;
+  if (!user) throw new Error("User not authenticated");
   try {
-    const user = auth.currentUser;
-    if (!user) throw new Error("User not authenticated");
-
-    await updateDoc(
-      doc(db, "devices", deviceId, "alerts", alertId),
-      {
-        acknowledged: true,
-        acknowledgedBy: user.uid,
-        acknowledgedAt: serverTimestamp(),
-      }
-    );
-
-    console.log("[Firestore] ML alert acknowledged:", alertId);
+    const authHeader = await getAuthHeader();
+    const res = await fetch(`${ALERT_API_BASE}/alerts/${encodeURIComponent(alertId)}/rating`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', ...authHeader },
+      body: JSON.stringify({}),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      console.warn('[EC2] acknowledgeMLAlert failed:', res.status, body);
+    } else {
+      console.log('[EC2] ML alert acknowledged:', alertId);
+    }
   } catch (error) {
-    console.error("[Firestore] Error acknowledging ML alert:", error);
+    console.error('[EC2] Error acknowledging ML alert:', error);
     throw error;
   }
 }
@@ -1129,13 +1399,17 @@ export async function acknowledgeMLAlert(
  */
 export async function deleteMLAlert(
   _deviceId: string,
-  _alertId: string
+  alertId: string
 ): Promise<void> {
-  // Alerts are preserved permanently in Firestore.
-  // "Deletion" is handled locally on each device: the app filters out alerts
-  // older than the user's chosen retention period (7 / 15 / 30 days, or never)
-  // and re-applies that filter once a day. No Firestore documents are removed.
-  console.log("[Firestore] deleteMLAlert: no-op — backend data preserved, local retention filter applies.");
+  const user = auth.currentUser;
+  if (!user) throw new Error("User not authenticated");
+
+  const deletedIds = await loadDeletedAlertIds(user.uid);
+  deletedIds.add(alertId);
+  await saveDeletedAlertIds(user.uid, deletedIds);
+
+  // Deletion is local-only: we hide the alert in this app profile and keep server data intact.
+  console.log("[Local] ML alert marked as deleted in this app profile:", alertId);
 }
 
 /**

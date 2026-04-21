@@ -31,6 +31,33 @@ if (!globalAny.__keepAwakeErrorGuardInstalled && globalAny.ErrorUtils?.setGlobal
 
 const adminPortalUrl = process.env.EXPO_PUBLIC_ADMIN_PORTAL_URL || "http://13.205.201.82";
 
+async function isUserBlocked(firebaseUser: User): Promise<boolean> {
+  if (!firebaseUser?.uid || !firebaseUser?.email) {
+    return false;
+  }
+
+  try {
+    const accessResponse = await fetch(`${adminPortalUrl}/api/users/access-status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        userId: firebaseUser.uid,
+        email: firebaseUser.email,
+      }),
+    });
+
+    if (!accessResponse.ok) {
+      return false;
+    }
+
+    const accessData = await accessResponse.json();
+    return accessData?.isBlocked === true || accessData?.blocked === true;
+  } catch (error) {
+    console.warn("[RootLayout] Access-status check failed:", error);
+    return false;
+  }
+}
+
 async function syncUserToAdminPortal(firebaseUser: User) {
   if (!firebaseUser?.uid || !firebaseUser?.email) {
     console.warn("[RootLayout] Skipping user sync: missing uid/email");
@@ -90,6 +117,7 @@ export default function RootLayout() {
 
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [accessGateLoading, setAccessGateLoading] = useState(true);
   const [lastSyncedUserId, setLastSyncedUserId] = useState<string | null>(null);
 
   /**
@@ -98,7 +126,7 @@ export default function RootLayout() {
   useEffect(() => {
     console.log("[RootLayout] Initializing auth listener");
 
-    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       console.log(
         "[RootLayout] Auth state changed:",
         firebaseUser?.email ?? "null"
@@ -107,8 +135,35 @@ export default function RootLayout() {
         "[RootLayout] 🆔 Firebase User ID:",
         firebaseUser?.uid ?? "null"
       );
+
+      setAccessGateLoading(true);
+
+      if (firebaseUser) {
+        const blocked = await isUserBlocked(firebaseUser);
+        if (blocked) {
+          try {
+            await auth.signOut();
+          } catch (error) {
+            console.warn("[RootLayout] Failed to sign out blocked user:", error);
+          }
+
+          router.replace({
+            pathname: "/",
+            params: {
+              blocked: "1",
+            },
+          });
+
+          setUser(null);
+          setLoading(false);
+          setAccessGateLoading(false);
+          return;
+        }
+      }
+
       setUser(firebaseUser);
       setLoading(false);
+      setAccessGateLoading(false);
     });
 
     return unsubscribe;
@@ -147,10 +202,10 @@ export default function RootLayout() {
    * 🔀 Route protection & redirects
    */
   useEffect(() => {
-    if (loading) return;
+    if (loading || accessGateLoading) return;
 
     const currentRoot = segments[0]; // first route segment
-    const isOnLogin = segments.length === 0; // "/"
+    const isOnLogin = !currentRoot; // "/"
     const isOnDashboard = currentRoot === "dashboard";
     const isOnSensorList = currentRoot === "sensor-list";
     const isOnAllowedRoute = isOnDashboard || isOnSensorList;
@@ -171,12 +226,12 @@ export default function RootLayout() {
       console.log("[RootLayout] 🔐 No user on protected route → redirect to login");
       router.replace("/");
     }
-  }, [user, loading, segments]);
+  }, [user, loading, accessGateLoading, segments]);
 
   /**
    * ⏳ Splash/loading state
    */
-  if (loading) {
+  if (loading || accessGateLoading) {
     return (
       <View
         style={{

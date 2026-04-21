@@ -1,5 +1,6 @@
 import { View, Text, ActivityIndicator, TouchableOpacity, ScrollView, StyleSheet, Linking, TextInput, Modal, Image } from "react-native";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import { GoogleSignin, statusCodes } from "@react-native-google-signin/google-signin";
 import { GoogleAuthProvider, signInWithCredential, signOut, signInWithEmailAndPassword } from "firebase/auth";
 import { auth } from "../firebase/firebaseConfig";
@@ -15,6 +16,92 @@ const webClientId =
 
 const adminPortalUrl = process.env.EXPO_PUBLIC_ADMIN_PORTAL_URL || 'http://13.205.201.82';
 const userGuideUrl = 'https://rutaghacs.kesug.com/?i=1';
+const firebaseWebApiKey = auth.app.options.apiKey;
+
+const isGmailAddress = (input: string) => /@(?:gmail|googlemail)\.com$/i.test(input.trim());
+const isValidEmailFormat = (input: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.trim());
+
+type SignupAuthResponse = {
+  localId: string;
+  email: string;
+  idToken: string;
+  refreshToken?: string;
+};
+
+const createFirebaseUserWithoutSigningIn = async (
+  userEmail: string,
+  userPassword: string
+): Promise<SignupAuthResponse> => {
+  if (!firebaseWebApiKey) {
+    throw new Error("Firebase API key is not configured");
+  }
+
+  const response = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${firebaseWebApiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: userEmail,
+        password: userPassword,
+        returnSecureToken: true,
+      }),
+    }
+  );
+
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(result?.error?.message || "SIGNUP_FAILED");
+  }
+
+  return result as SignupAuthResponse;
+};
+
+const updateFirebaseUserProfileWithoutSigningIn = async (
+  idToken: string,
+  displayName: string
+) => {
+  if (!firebaseWebApiKey) {
+    throw new Error("Firebase API key is not configured");
+  }
+
+  const response = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:update?key=${firebaseWebApiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idToken,
+        displayName,
+        returnSecureToken: false,
+      }),
+    }
+  );
+
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(result?.error?.message || "PROFILE_UPDATE_FAILED");
+  }
+};
+
+const deleteFirebaseUserWithoutSigningIn = async (idToken: string) => {
+  if (!firebaseWebApiKey) {
+    return;
+  }
+
+  try {
+    await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:delete?key=${firebaseWebApiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ idToken }),
+      }
+    );
+  } catch (deleteError) {
+    console.warn("[Login] Failed to roll back Firebase user after sync failure:", deleteError);
+  }
+};
 
 GoogleSignin.configure({
   webClientId: webClientId,
@@ -22,12 +109,18 @@ GoogleSignin.configure({
 });
 
 export default function LoginScreen() {
+  const router = useRouter();
+  const params = useLocalSearchParams<{ blocked?: string | string[] }>();
   const [signInPhase, setSignInPhase] = useState<"idle" | "authenticating">("idle");
   const [authMethodLabel, setAuthMethodLabel] = useState("Signing you in...");
   const [signedInEmail, setSignedInEmail] = useState<string | null>(null);
   const [showEmailForm, setShowEmailForm] = useState(false);
+  const [showSignUpForm, setShowSignUpForm] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [signUpEmail, setSignUpEmail] = useState("");
+  const [signUpDisplayName, setSignUpDisplayName] = useState("");
+  const [signUpPassword, setSignUpPassword] = useState("");
   const [styledAlertVisible, setStyledAlertVisible] = useState(false);
   const [styledAlertConfig, setStyledAlertConfig] = useState<StyledAlertProps>({
     visible: false,
@@ -37,6 +130,7 @@ export default function LoginScreen() {
     onClose: () => setStyledAlertVisible(false),
   });
   const loginInFlightRef = useRef(false);
+  const blockedPromptShownRef = useRef(false);
 
   const isSigningIn = signInPhase !== "idle";
 
@@ -61,43 +155,68 @@ export default function LoginScreen() {
     type: StyledAlertProps["type"] = "error"
   ) => {
     setShowEmailForm(false);
+    setShowSignUpForm(false);
     setPassword("");
+    setSignUpPassword("");
 
     setTimeout(() => {
       showStyledAlert(title, message, type);
     }, 0);
   };
 
+  useEffect(() => {
+    const blockedParam = Array.isArray(params.blocked) ? params.blocked[0] : params.blocked;
+    if (blockedParam === "1" && !blockedPromptShownRef.current) {
+      blockedPromptShownRef.current = true;
+      showAuthPrompt(
+        "Access denied",
+        "Access denied, contact administrator for activation.",
+        "error"
+      );
+    }
+  }, [params.blocked]);
+
   const syncUserToAdminPortal = async (
     userId: string,
     userEmail: string | null,
     displayName?: string | null,
-    authProvider: "google" | "password" = "google"
+    authProvider: "google" | "password" = "google",
+    createdViaSignup = false
   ) => {
-    if (!userEmail) return;
+    if (!userEmail) return null;
 
+    const syncResponse = await fetch(`${adminPortalUrl}/api/users/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        userId,
+        email: userEmail,
+        displayName: displayName || userEmail,
+        authProvider,
+        createdViaSignup,
+        isGmail: isGmailAddress(userEmail),
+      }),
+    });
+
+    const rawBody = await syncResponse.text();
+    let parsedBody: any = null;
     try {
-      const syncResponse = await fetch(`${adminPortalUrl}/api/users/sync`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          userId,
-          email: userEmail,
-          displayName: displayName || userEmail,
-          authProvider,
-        }),
-      });
-
-      if (!syncResponse.ok) {
-        console.warn('[Login] Failed to sync user to admin portal:', await syncResponse.text());
-      } else {
-        console.log('[Login] User synced to admin portal');
-      }
-    } catch (syncError) {
-      console.warn('[Login] User sync error:', syncError);
+      parsedBody = rawBody ? JSON.parse(rawBody) : null;
+    } catch {
+      parsedBody = rawBody;
     }
+
+    if (!syncResponse.ok) {
+      const errorMessage = typeof parsedBody === 'object' && parsedBody?.error
+        ? parsedBody.error
+        : rawBody || 'Failed to sync user to admin portal';
+      throw new Error(errorMessage);
+    }
+
+    console.log('[Login] User synced to admin portal');
+    return parsedBody;
   };
 
   console.log("[Login] Web Client ID:", webClientId);
@@ -173,6 +292,7 @@ export default function LoginScreen() {
 
       console.log("[Login] ✅ Firebase sign-in success:", firebaseUser.user.email);
       setSignedInEmail(firebaseUser.user.email);
+      router.replace("/dashboard");
     } catch (error: any) {
       console.error("[Login] ❌ Error:", error.code, error.message);
       console.error("[Login] Full error:", JSON.stringify(error, null, 2));
@@ -216,6 +336,31 @@ export default function LoginScreen() {
 
     try {
       const firebaseUser = await signInWithEmailAndPassword(auth, trimmedEmail, password);
+
+      const accessResponse = await fetch(`${adminPortalUrl}/api/users/access-status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId: firebaseUser.user.uid,
+          email: firebaseUser.user.email,
+        }),
+      });
+
+      if (accessResponse.ok) {
+        const accessData = await accessResponse.json();
+        const blocked = accessData?.isBlocked === true || accessData?.blocked === true;
+
+        if (blocked) {
+          await signOut(auth);
+          showAuthPrompt(
+            "Access denied",
+            "Access denied, contact administrator for activation.",
+            "error"
+          );
+          return;
+        }
+      }
+
       await syncUserToAdminPortal(
         firebaseUser.user.uid,
         firebaseUser.user.email,
@@ -225,6 +370,7 @@ export default function LoginScreen() {
 
       setSignedInEmail(firebaseUser.user.email);
       console.log("[Login] Email/password sign-in success:", firebaseUser.user.email);
+      router.replace("/dashboard");
     } catch (error: any) {
       console.error("[Login] Email/password error:", error?.code, error?.message);
 
@@ -242,6 +388,92 @@ export default function LoginScreen() {
         );
       } else {
         showAuthPrompt("Sign-in failed", "Unable to sign in with email and password.", "error");
+      }
+    } finally {
+      setSignInPhase("idle");
+    }
+  };
+
+  const handleEmailPasswordSignUp = async () => {
+    if (isSigningIn || loginInFlightRef.current) {
+      return;
+    }
+
+    const trimmedEmail = signUpEmail.trim().toLowerCase();
+    const trimmedDisplayName = signUpDisplayName.trim();
+
+    if (!trimmedEmail || !trimmedDisplayName || !signUpPassword) {
+      showStyledAlert("Missing details", "Please enter email, display name, and password.", "warning");
+      return;
+    }
+
+    if (!isValidEmailFormat(trimmedEmail)) {
+      showStyledAlert("Invalid email", "Please enter a valid email address.", "error");
+      return;
+    }
+
+    if (signUpPassword.length < 6) {
+      showStyledAlert("Weak password", "Password must be at least 6 characters.", "warning");
+      return;
+    }
+
+    setSignInPhase("authenticating");
+    setAuthMethodLabel("Creating your account...");
+
+    try {
+      const createdUser = await createFirebaseUserWithoutSigningIn(trimmedEmail, signUpPassword);
+
+      if (trimmedDisplayName) {
+        await updateFirebaseUserProfileWithoutSigningIn(createdUser.idToken, trimmedDisplayName);
+      }
+
+      let syncAcknowledgement: any;
+      try {
+        syncAcknowledgement = await syncUserToAdminPortal(
+          createdUser.localId,
+          createdUser.email,
+          trimmedDisplayName || createdUser.email,
+          "password",
+          true
+        );
+      } catch (syncError) {
+        await deleteFirebaseUserWithoutSigningIn(createdUser.idToken);
+        throw syncError;
+      }
+
+      if (!syncAcknowledgement?.acknowledged) {
+        await deleteFirebaseUserWithoutSigningIn(createdUser.idToken);
+        throw new Error('BACKEND_ACKNOWLEDGEMENT_MISSING');
+      }
+
+      setShowSignUpForm(false);
+      setShowEmailForm(false);
+      setSignUpEmail("");
+      setSignUpDisplayName("");
+      setSignUpPassword("");
+
+      showStyledAlert(
+        "Account created successfully",
+        "Account created successfully, wait for admin approval.",
+        "success"
+      );
+    } catch (error: any) {
+      console.error("[Login] Email/password sign-up error:", error?.code, error?.message);
+
+      if (error?.message === "EMAIL_EXISTS" || error?.code === "auth/email-already-in-use") {
+        showStyledAlert("Sign-up failed", "This email is already registered.", "error");
+      } else if (error?.message === "INVALID_EMAIL" || error?.code === "auth/invalid-email") {
+        showStyledAlert("Sign-up failed", "Please enter a valid email address.", "error");
+      } else if (error?.message === "WEAK_PASSWORD : Password should be at least 6 characters" || error?.code === "auth/weak-password") {
+        showStyledAlert("Sign-up failed", "Password should be at least 6 characters.", "error");
+      } else if (error?.message === "BACKEND_ACKNOWLEDGEMENT_MISSING") {
+        showStyledAlert(
+          "Sign-up incomplete",
+          "User creation reached Firebase but backend acknowledgement was not received. Please try again.",
+          "error"
+        );
+      } else {
+        showStyledAlert("Sign-up failed", "Unable to create account. Please try again.", "error");
       }
     } finally {
       setSignInPhase("idle");
@@ -365,6 +597,87 @@ export default function LoginScreen() {
                   disabled={isSigningIn}
                 >
                   <Text style={styles.cancelEmailButtonText}>Cancel</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  onPress={() => {
+                    setShowEmailForm(false);
+                    setShowSignUpForm(true);
+                  }}
+                  disabled={isSigningIn}
+                  style={styles.signupLinkButton}
+                >
+                  <Text style={styles.signupLinkText}>Sign up</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </Modal>
+
+          <Modal
+            visible={showSignUpForm}
+            transparent
+            animationType="fade"
+            onRequestClose={() => !isSigningIn && setShowSignUpForm(false)}
+          >
+            <View style={styles.emailModalBackdrop}>
+              <View style={styles.emailModalCard}>
+                <Text style={styles.altAuthTitle}>Create Account</Text>
+
+                <TextInput
+                  style={styles.authInput}
+                  value={signUpEmail}
+                  onChangeText={setSignUpEmail}
+                  placeholder="Email"
+                  placeholderTextColor="#9CA3AF"
+                  keyboardType="email-address"
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  textContentType="emailAddress"
+                  editable={!isSigningIn}
+                />
+
+                <TextInput
+                  style={styles.authInput}
+                  value={signUpDisplayName}
+                  onChangeText={setSignUpDisplayName}
+                  placeholder="Display name"
+                  placeholderTextColor="#9CA3AF"
+                  autoCapitalize="words"
+                  autoCorrect={false}
+                  editable={!isSigningIn}
+                />
+
+                <TextInput
+                  style={styles.authInput}
+                  value={signUpPassword}
+                  onChangeText={setSignUpPassword}
+                  placeholder="Password"
+                  placeholderTextColor="#9CA3AF"
+                  secureTextEntry
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  textContentType="newPassword"
+                  editable={!isSigningIn}
+                />
+
+                <TouchableOpacity
+                  onPress={handleEmailPasswordSignUp}
+                  style={[styles.emailButton, isSigningIn && { opacity: 0.7 }]}
+                  disabled={isSigningIn}
+                >
+                  {isSigningIn ? (
+                    <ActivityIndicator size="small" color="#ffffff" />
+                  ) : (
+                    <Text style={styles.emailButtonText}>Submit</Text>
+                  )}
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  onPress={() => setShowSignUpForm(false)}
+                  style={styles.cancelEmailButton}
+                  disabled={isSigningIn}
+                >
+                  <Text style={styles.cancelEmailButtonText}>Close</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -762,6 +1075,18 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
     fontSize: 14,
     fontWeight: "600",
+  },
+  signupLinkButton: {
+    marginTop: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 6,
+  },
+  signupLinkText: {
+    color: "#1249B2",
+    fontSize: 14,
+    fontWeight: "700",
+    textDecorationLine: "underline",
   },
   signedInText: {
     marginTop: 30,
