@@ -5,6 +5,7 @@ import { auth, db } from "../firebase/firebaseConfig";
 import { doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
 import { View, ActivityIndicator, LogBox } from "react-native";
 import { registerFCMToken } from "../firebase/fcmService";
+import { getOrCreateInstallationId } from "../utils/installationId";
 import "../global.css";
 
 LogBox.ignoreLogs([
@@ -58,16 +59,27 @@ async function isUserBlocked(firebaseUser: User): Promise<boolean> {
   }
 }
 
+class InstallationLimitError extends Error {
+  installationLimitExceeded = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "InstallationLimitError";
+  }
+}
+
 async function syncUserToAdminPortal(firebaseUser: User) {
   if (!firebaseUser?.uid || !firebaseUser?.email) {
     console.warn("[RootLayout] Skipping user sync: missing uid/email");
     return;
   }
 
+  const installationId = await getOrCreateInstallationId();
+
   const payload = {
     userId: firebaseUser.uid,
     email: firebaseUser.email,
     displayName: firebaseUser.displayName || firebaseUser.email,
+    installationId,
   };
 
   const response = await fetch(`${adminPortalUrl}/api/users/sync`, {
@@ -80,6 +92,19 @@ async function syncUserToAdminPortal(firebaseUser: User) {
 
   if (!response.ok) {
     const responseText = await response.text();
+    let parsedBody: any = null;
+    try {
+      parsedBody = responseText ? JSON.parse(responseText) : null;
+    } catch {
+      parsedBody = null;
+    }
+
+    if (response.status === 403 && parsedBody?.installationLimitExceeded) {
+      throw new InstallationLimitError(
+        parsedBody?.message || "This account is already signed in on the maximum number of devices."
+      );
+    }
+
     throw new Error(`HTTP ${response.status}: ${responseText}`);
   }
 
@@ -179,21 +204,37 @@ export default function RootLayout() {
       return;
     }
 
-    Promise.allSettled([
-      syncUserToAdminPortal(user),
-      syncUserProfileToFirestore(user),
-      registerFCMToken(),
-    ])
-      .then((results) => {
-        const hasFailure = results.some((item) => item.status === "rejected");
-        if (hasFailure) {
-          results.forEach((item) => {
-            if (item.status === "rejected") {
-              console.warn("[RootLayout] User sync task failed:", item.reason?.message || item.reason);
-            }
+    // The admin-portal sync must run first and must succeed (or explicitly
+    // fail with an installation-limit error) before we let the user proceed,
+    // since it's the gate that enforces the max-installations-per-account rule.
+    syncUserToAdminPortal(user)
+      .then(async () => {
+        await Promise.allSettled([
+          syncUserProfileToFirestore(user),
+          registerFCMToken(),
+        ]);
+        setLastSyncedUserId(user.uid);
+      })
+      .catch(async (error) => {
+        if (error instanceof InstallationLimitError) {
+          console.warn("[RootLayout] Installation limit exceeded, signing out:", error.message);
+          try {
+            await auth.signOut();
+          } catch (signOutError) {
+            console.warn("[RootLayout] Failed to sign out after installation limit block:", signOutError);
+          }
+
+          router.replace({
+            pathname: "/",
+            params: { installationLimit: "1" },
           });
+          setUser(null);
+          return;
         }
 
+        console.warn("[RootLayout] User sync task failed:", error?.message || error);
+        // Non-fatal for other errors — still allow the app to proceed and
+        // retry sync on next auth state change.
         setLastSyncedUserId(user.uid);
       });
   }, [user, lastSyncedUserId]);

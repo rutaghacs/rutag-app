@@ -75,6 +75,12 @@
         }
       ],
       "expo-video",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "This app needs camera access to scan device pairing QR codes."
+        }
+      ],
       "./plugins/withAndroidCleartext"
     ],
     "experiments": {

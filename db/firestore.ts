@@ -262,7 +262,8 @@ async function alertApiRequest<T = any>(path: string, options: RequestInit = {})
   }
 
   if (!response.ok) {
-    throw new Error(payload?.error || payload?.message || `Alert API request failed: ${response.status}`);
+    const errorMessage = payload?.reason || payload?.error || payload?.message || `Alert API request failed: ${response.status}`;
+    throw new Error(errorMessage);
   }
 
   return (payload ?? {}) as T;
@@ -756,6 +757,33 @@ export async function unclaimDevice(deviceId: string) {
     return deviceId;
   } catch (error) {
     console.error("[Alerts] Error removing device membership:", error);
+    throw error;
+  }
+}
+
+/**
+ * Pair a device to the current user using the pairing token encoded in the
+ * QR code displayed by the Raspberry Pi (Devices tab -> "Scan to Add").
+ * This is the ONLY supported way to add a device — there is no browse/list
+ * fallback, since only a physically-present, valid QR code can succeed.
+ */
+export async function pairDeviceWithQr(deviceId: string, token: string) {
+  const user = auth.currentUser;
+  if (!user) throw new Error("No user authenticated");
+
+  try {
+    const result = await alertApiRequest<{ device?: { device_name?: string; location?: string } }>(
+      "/devices/pair",
+      {
+        method: "POST",
+        body: JSON.stringify({ deviceId, token }),
+      }
+    );
+
+    console.log("[Alerts] Device paired via QR:", deviceId, "for user:", user.uid);
+    return result;
+  } catch (error) {
+    console.error("[Alerts] Error pairing device via QR:", error);
     throw error;
   }
 }

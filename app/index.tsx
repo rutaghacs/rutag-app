@@ -9,13 +9,14 @@ import Constants from "expo-constants";
 import { LinearGradient } from "expo-linear-gradient";
 import { MaterialIcons } from "@expo/vector-icons";
 import StyledAlert, { StyledAlertProps } from "../components/StyledAlert";
+import { getOrCreateInstallationId } from "../utils/installationId";
 
 const webClientId =
   process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID ??
   Constants.expoConfig?.extra?.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID;
 
 const adminPortalUrl = process.env.EXPO_PUBLIC_ADMIN_PORTAL_URL || 'http://13.205.201.82';
-const userGuideUrl = 'https://rutaghacs.kesug.com/?i=1';
+const userGuideUrl = (process.env.EXPO_PUBLIC_ADMIN_PORTAL_URL || 'http://16.192.60.95').replace(/\/$/, '') + '/app-user-guide.html';
 const firebaseWebApiKey = auth.app.options.apiKey;
 
 const isGmailAddress = (input: string) => /@(?:gmail|googlemail)\.com$/i.test(input.trim());
@@ -110,7 +111,7 @@ GoogleSignin.configure({
 
 export default function LoginScreen() {
   const router = useRouter();
-  const params = useLocalSearchParams<{ blocked?: string | string[] }>();
+  const params = useLocalSearchParams<{ blocked?: string | string[]; installationLimit?: string | string[] }>();
   const [signInPhase, setSignInPhase] = useState<"idle" | "authenticating">("idle");
   const [authMethodLabel, setAuthMethodLabel] = useState("Signing you in...");
   const [signedInEmail, setSignedInEmail] = useState<string | null>(null);
@@ -176,6 +177,20 @@ export default function LoginScreen() {
     }
   }, [params.blocked]);
 
+  useEffect(() => {
+    const installationLimitParam = Array.isArray(params.installationLimit)
+      ? params.installationLimit[0]
+      : params.installationLimit;
+    if (installationLimitParam === "1" && !blockedPromptShownRef.current) {
+      blockedPromptShownRef.current = true;
+      showAuthPrompt(
+        "Device limit reached",
+        "This account is already signed in on the maximum number of mobiles. Sign out from another device to continue.",
+        "error"
+      );
+    }
+  }, [params.installationLimit]);
+
   const syncUserToAdminPortal = async (
     userId: string,
     userEmail: string | null,
@@ -184,6 +199,8 @@ export default function LoginScreen() {
     createdViaSignup = false
   ) => {
     if (!userEmail) return null;
+
+    const installationId = await getOrCreateInstallationId();
 
     const syncResponse = await fetch(`${adminPortalUrl}/api/users/sync`, {
       method: 'POST',
@@ -197,6 +214,7 @@ export default function LoginScreen() {
         authProvider,
         createdViaSignup,
         isGmail: isGmailAddress(userEmail),
+        installationId,
       }),
     });
 
@@ -209,6 +227,14 @@ export default function LoginScreen() {
     }
 
     if (!syncResponse.ok) {
+      if (syncResponse.status === 403 && parsedBody?.installationLimitExceeded) {
+        const limitError: any = new Error(
+          parsedBody?.message || "This account is already signed in on the maximum number of devices."
+        );
+        limitError.installationLimitExceeded = true;
+        throw limitError;
+      }
+
       const errorMessage = typeof parsedBody === 'object' && parsedBody?.error
         ? parsedBody.error
         : rawBody || 'Failed to sync user to admin portal';
@@ -297,6 +323,12 @@ export default function LoginScreen() {
       console.error("[Login] ❌ Error:", error.code, error.message);
       console.error("[Login] Full error:", JSON.stringify(error, null, 2));
 
+      if (error?.installationLimitExceeded) {
+        await signOut(auth).catch(() => {});
+        showAuthPrompt("Device limit reached", error.message, "error");
+        return;
+      }
+
       if (error?.code === "10") {
         console.error(
           "[Login] Android DEVELOPER_ERROR (10): OAuth mismatch. Check Firebase Android app package + SHA-1/SHA-256, then re-download google-services.json."
@@ -373,6 +405,12 @@ export default function LoginScreen() {
       router.replace("/dashboard");
     } catch (error: any) {
       console.error("[Login] Email/password error:", error?.code, error?.message);
+
+      if (error?.installationLimitExceeded) {
+        await signOut(auth).catch(() => {});
+        showAuthPrompt("Device limit reached", error.message, "error");
+        return;
+      }
 
       if (error?.code === "auth/invalid-credential" || error?.code === "auth/wrong-password") {
         showAuthPrompt("Sign-in failed", "Invalid email or password.", "error");
@@ -460,7 +498,9 @@ export default function LoginScreen() {
     } catch (error: any) {
       console.error("[Login] Email/password sign-up error:", error?.code, error?.message);
 
-      if (error?.message === "EMAIL_EXISTS" || error?.code === "auth/email-already-in-use") {
+      if (error?.installationLimitExceeded) {
+        showStyledAlert("Device limit reached", error.message, "error");
+      } else if (error?.message === "EMAIL_EXISTS" || error?.code === "auth/email-already-in-use") {
         showStyledAlert("Sign-up failed", "This email is already registered.", "error");
       } else if (error?.message === "INVALID_EMAIL" || error?.code === "auth/invalid-email") {
         showStyledAlert("Sign-up failed", "Please enter a valid email address.", "error");
