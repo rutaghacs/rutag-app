@@ -1,4 +1,4 @@
-import {
+﻿import {
   collection,
   query,
   where,
@@ -767,7 +767,7 @@ export async function unclaimDevice(deviceId: string) {
  * This is the ONLY supported way to add a device — there is no browse/list
  * fallback, since only a physically-present, valid QR code can succeed.
  */
-export async function pairDeviceWithQr(deviceId: string, token: string) {
+export async function pairDeviceWithQr(deviceId: string, passkey: string) {
   const user = auth.currentUser;
   if (!user) throw new Error("No user authenticated");
 
@@ -776,14 +776,14 @@ export async function pairDeviceWithQr(deviceId: string, token: string) {
       "/devices/pair",
       {
         method: "POST",
-        body: JSON.stringify({ deviceId, token }),
+        body: JSON.stringify({ deviceId, passkey }),
       }
     );
 
-    console.log("[Alerts] Device paired via QR:", deviceId, "for user:", user.uid);
+    console.log("[Alerts] Device paired via QR+passkey:", deviceId, "for user:", user.uid);
     return result;
   } catch (error) {
-    console.error("[Alerts] Error pairing device via QR:", error);
+    console.error("[Alerts] Error pairing device via QR+passkey:", error);
     throw error;
   }
 }
