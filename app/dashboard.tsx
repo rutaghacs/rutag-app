@@ -1062,15 +1062,6 @@ export default function Dashboard() {
                         </View>
                       </View>
 
-                      <View style={styles.metricRow}>
-                        <Text style={styles.metricLabel}>Last Pulse</Text>
-                        <Text style={[styles.metricValue, !isOnline && styles.metricDanger]}>{getDeviceLastPulse(item)}</Text>
-                      </View>
-                      <View style={styles.metricRow}>
-                        <Text style={styles.metricLabel}>Uptime</Text>
-                        <Text style={[styles.metricValue, isOnline ? styles.metricGood : null]}>{getDeviceUptime(item, index)}</Text>
-                      </View>
-
                       <View style={styles.devicePrimaryActions}>
                         <TouchableOpacity style={styles.primaryAction} onPress={() => handleSensorControl(item)}>
                           <MaterialIcons name="settings-input-component" size={15} color="#6B7280" />
