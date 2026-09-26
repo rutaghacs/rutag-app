@@ -10,6 +10,7 @@ import { LinearGradient } from "expo-linear-gradient";
 import { MaterialIcons } from "@expo/vector-icons";
 import StyledAlert, { StyledAlertProps } from "../components/StyledAlert";
 import { getOrCreateInstallationId } from "../utils/installationId";
+import { markSessionStart } from "../utils/sessionExpiry";
 
 const webClientId =
   process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID ??
@@ -111,7 +112,7 @@ GoogleSignin.configure({
 
 export default function LoginScreen() {
   const router = useRouter();
-  const params = useLocalSearchParams<{ blocked?: string | string[]; installationLimit?: string | string[] }>();
+  const params = useLocalSearchParams<{ blocked?: string | string[]; installationLimit?: string | string[]; sessionExpired?: string | string[] }>();
   const [signInPhase, setSignInPhase] = useState<"idle" | "authenticating">("idle");
   const [authMethodLabel, setAuthMethodLabel] = useState("Signing you in...");
   const [signedInEmail, setSignedInEmail] = useState<string | null>(null);
@@ -190,6 +191,20 @@ export default function LoginScreen() {
       );
     }
   }, [params.installationLimit]);
+
+  useEffect(() => {
+    const sessionExpiredParam = Array.isArray(params.sessionExpired)
+      ? params.sessionExpired[0]
+      : params.sessionExpired;
+    if (sessionExpiredParam === "1" && !blockedPromptShownRef.current) {
+      blockedPromptShownRef.current = true;
+      showAuthPrompt(
+        "Session expired",
+        "Your session has expired. Please sign in again to continue.",
+        "info"
+      );
+    }
+  }, [params.sessionExpired]);
 
   const syncUserToAdminPortal = async (
     userId: string,
@@ -317,6 +332,7 @@ export default function LoginScreen() {
       }
 
       console.log("[Login] ✅ Firebase sign-in success:", firebaseUser.user.email);
+      await markSessionStart(firebaseUser.user.uid);
       setSignedInEmail(firebaseUser.user.email);
       router.replace("/dashboard");
     } catch (error: any) {
@@ -400,6 +416,7 @@ export default function LoginScreen() {
         "password"
       );
 
+      await markSessionStart(firebaseUser.user.uid);
       setSignedInEmail(firebaseUser.user.email);
       console.log("[Login] Email/password sign-in success:", firebaseUser.user.email);
       router.replace("/dashboard");

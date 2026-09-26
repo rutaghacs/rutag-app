@@ -6,6 +6,7 @@ import { doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
 import { View, ActivityIndicator, LogBox } from "react-native";
 import { registerFCMToken } from "../firebase/fcmService";
 import { getOrCreateInstallationId } from "../utils/installationId";
+import { isSessionExpired, clearSessionStart } from "../utils/sessionExpiry";
 import "../global.css";
 
 LogBox.ignoreLogs([
@@ -179,6 +180,23 @@ export default function RootLayout() {
             },
           });
 
+          setUser(null);
+          setLoading(false);
+          setAccessGateLoading(false);
+          return;
+        }
+
+        // Enforce the 7-day session lifetime. If the session has expired the
+        // user is signed out and sent back to login to re-authenticate.
+        const expired = await isSessionExpired(firebaseUser.uid);
+        if (expired) {
+          try {
+            await clearSessionStart(firebaseUser.uid);
+            await auth.signOut();
+          } catch (error) {
+            console.warn("[RootLayout] Failed to sign out expired session:", error);
+          }
+          router.replace({ pathname: "/", params: { sessionExpired: "1" } });
           setUser(null);
           setLoading(false);
           setAccessGateLoading(false);

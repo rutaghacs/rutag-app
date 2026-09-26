@@ -37,10 +37,6 @@ export default function PasskeyInputModal({
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.overlay}>
         <View style={styles.card}>
           <Text style={styles.title}>Enter Passkey</Text>
-          <Text style={styles.subtitle}>
-            Enter the passkey shown on your Raspberry Pi screen or in{" "}
-            <Text style={styles.code}>passkey.txt</Text>
-          </Text>
           {deviceId ? <Text style={styles.deviceIdLabel} numberOfLines={1}>Device: {deviceId}</Text> : null}
           <TextInput
             style={styles.input}
