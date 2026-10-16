@@ -1,0 +1,66 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Environment and secrets (NEVER commit credentials)
+.env
+.env.local
+.env.*.local
+firebase/firebaseConfig.js
+
+# Firebase / Google service credentials (public repo — keep these OUT of git)
+google-services.json
+GoogleService-Info.plist
+serviceAccountKey.json
+*serviceaccount*.json
+*firebase-adminsdk*.json
+
+# Session/scratch artifacts
+_*.log
+_*.txt
+_ec2_review/
+_ec2_sensor/
+_ec2_admin/
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.keystore
+key.properties
+android/key.properties
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+app-example
+
+# generated native folders
+/ios
+/android
